@@ -105,7 +105,7 @@ def compute_signatures(path: torch.Tensor,
         gpu_optimized=True
     )                                           
 
-    return sigs_raw.squeeze(0).to(device)
+    return sigs_raw.squeeze(0).to(device=device, dtype=torch.float64)
 
 def build_kernel_from_signatures(sigs_flat: torch.Tensor,
                                  sigma: float = 1.0,
@@ -475,7 +475,7 @@ def evaluate_solution_from_beta_method1(
     print(f"  Ku.dtype   = {Ku.dtype}")
     print(f"  x.dtype    = {x.dtype}")
     print(f"  beta.dtype = {beta.dtype}")
-    
+
     x0 = x[0]
 
     u_dd = Ku2 @ beta
