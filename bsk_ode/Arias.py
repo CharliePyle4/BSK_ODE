@@ -446,41 +446,26 @@ def solve_signature_kernel_non_branched(x, f,
 
     with torch.no_grad():
 
-        t0 = time.time()
-        print("building Path")
         X = torch.stack([x, f], dim=1)           # (T,2)
-        t1 = time.time()
-        print(f"  time (build path): {t1 - t0:.3f} s")
 
-        print("Computing Signatures")
-        t2 = time.time()
+   
         X_sig = compute_signatures(X, depth)     # (T,D)
-        t3 = time.time()
-        print(f"  time (compute signatures): {t3 - t2:.3f} s")
-
-        print("maybe normalizing")
-        t4 = time.time()
+   
+   
         X_sig_norm = apply_signature_normalization(
             X_sig, depth=depth, dim=2, scheme=norm_scheme, **norm_kwargs
         )
-        t5 = time.time()
-        print(f"  time (normalization): {t5 - t4:.3f} s")
-
-        print("building kernel from sigs")
-        t6 = time.time()
+ 
+       
         Ksig = build_kernel_from_signatures(
             X_sig_norm, sigma=rbf_sigma, kernel_type=kernel_type
         )
-        t7 = time.time()
-        print(f"  time (build kernel): {t7 - t6:.3f} s")
-
+   
 
         Ksig = Ksig.to(torch.float64)
         x    = x.to(torch.float64)
         f    = f.to(torch.float64)
 
-        print("finding betas, evaluating")
-        t8 = time.time()
         beta_w, u, f_pred_final = solve_betas(
           Ksig=Ksig,
           f=f,
@@ -491,17 +476,11 @@ def solve_signature_kernel_non_branched(x, f,
           b_fun=b_fun,
           c_fun=c_fun,
         )
-        t9 = time.time()
-        print(f"  time (solve betas): {t9 - t8:.3f} s")
+  
 
-        print("betas converged, evaluating forcing loss")
-        t10 = time.time()
         final_loss = forcing_loss(f, f_pred_final)
-        t11 = time.time()
-        print(f"  time (forcing loss): {t11 - t10:.3f} s")
-
+ 
         print(f"non-branched model forcing match loss: {final_loss.item():.3e}")
-        print(f"total time (non-branched): {t11 - t0:.3f} s")
 
     return u, f_pred_final
 
