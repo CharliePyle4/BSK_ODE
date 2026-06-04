@@ -1151,6 +1151,7 @@ def test_nonbranched_method1(
     print(f"final forcing loss (train+test, last beta): {final_loss.item():.3e}")
 
     return u_pred_full, f_pred_full
+
 def test_branched_tlift_method1(
     x_train: torch.Tensor,
     x_test: torch.Tensor,
@@ -1257,8 +1258,9 @@ def test_branched_NN_method1(
 
     with torch.no_grad():
         #First train on training data and add to upred, fpred, full
-        X_train = torch.stack([x_train, f_train], dim=1)  # (T,2)
-        X_branched_train = pathextension(X_train)
+        X_train = torch.stack([x_train, f_train], dim=1)  # (T,2)                
+        out_ext_train = pathextension(X_train)
+        X_branched_train = torch.cat([X_train, out_ext_train], dim=1)
         X_sig_train = compute_signatures(X_branched_train, depth)  # (T,D)
         X_sig_norm_train = apply_signature_normalization(X_sig_train, depth=depth, dim=2, scheme=norm_scheme, **norm_kwargs)
         Ksig_train = build_kernel_from_signatures(X_sig_norm_train, sigma=rbf_sigma, kernel_type=kernel_type)
@@ -1276,7 +1278,8 @@ def test_branched_NN_method1(
                 x_retrain = torch.cat([x_train, x_test[:j]], dim=0)
                 f_retrain = torch.cat([f_train, f_test[:j]], dim=0)
                 X_train = torch.stack([x_retrain, f_retrain], dim=1)  # (T,2)
-                X_branched_train = pathextension(X_train)
+                out_ext_train = pathextension(X_train)
+                X_branched_train = torch.cat([X_train, out_ext_train], dim=1)
                 X_sig_train = compute_signatures(X_branched_train, depth)  # (T,D)
                 X_sig_norm_train = apply_signature_normalization(X_sig_train, depth=depth, dim=2, scheme=norm_scheme, **norm_kwargs)
                 Ksig_train = build_kernel_from_signatures(X_sig_norm_train, sigma=rbf_sigma, kernel_type=kernel_type)
@@ -1286,7 +1289,8 @@ def test_branched_NN_method1(
             x_curr = torch.cat([x_train, x_test[:j]], dim=0)
             f_curr = torch.cat([f_train, f_test[:j]], dim=0)
             X_curr = torch.stack([x_curr, f_curr], dim=1)
-            X_curr_branched = pathextension(X_curr)
+            out_ext_curr = pathextension(X_curr)
+            X_curr_branched = torch.cat([X_curr, out_ext_curr], dim=1)
 
             #Compute Signatures of new path and normalize
             X_sig_curr = compute_signatures(X_curr_branched, depth)
@@ -1495,7 +1499,8 @@ def test_branched_NN_method2(
     with torch.no_grad():
         #First train on training data and add to upred, fpred, full
         X_train = torch.stack([x_train, f_train], dim=1)  # (T,2)
-        X_branched_train = pathextension(X_train)
+        out_ext_train = pathextension(X_train)
+        X_branched_train = torch.cat([X_train, out_ext_train], dim=1)
         X_sig_train = compute_signatures(X_branched_train, depth)  # (T,D)
         X_sig_norm_train = apply_signature_normalization(X_sig_train, depth=depth, dim=2, scheme=norm_scheme, **norm_kwargs)
         Ksig_train = build_kernel_from_signatures(X_sig_norm_train, sigma=rbf_sigma, kernel_type=kernel_type)
@@ -1513,7 +1518,8 @@ def test_branched_NN_method2(
                 x_retrain = torch.cat([x_train, x_test[:j]], dim=0)
                 f_retrain = torch.cat([f_train, f_test[:j]], dim=0)
                 X_train = torch.stack([x_retrain, f_retrain], dim=1)  # (T,2)
-                X_branched_train = pathextension(X_train)
+                out_ext_train = pathextension(X_train)
+                X_branched_train = torch.cat([X_train, out_ext_train], dim=1)
                 X_sig_train = compute_signatures(X_branched_train, depth)  # (T,D)
                 X_sig_norm_train = apply_signature_normalization(X_sig_train, depth=depth, dim=2, scheme=norm_scheme, **norm_kwargs)
                 Ksig_train = build_kernel_from_signatures(X_sig_norm_train, sigma=rbf_sigma, kernel_type=kernel_type)
@@ -1523,7 +1529,8 @@ def test_branched_NN_method2(
             x_curr = torch.cat([x_train, x_test[:j]], dim=0)
             f_curr = torch.cat([f_train, f_test[:j]], dim=0)
             X_curr = torch.stack([x_curr, f_curr], dim=1)
-            X_curr_branched = pathextension(X_curr)
+            out_ext_curr = pathextension(X_curr)
+            X_curr_branched = torch.cat([X_curr, out_ext_curr], dim=1)
 
             #Compute Signatures of new path and normalize
             X_sig_curr = compute_signatures(X_curr_branched, depth)
@@ -2105,8 +2112,6 @@ def print_variant_errors(label, u_pred, f_pred, u_ref, f_true, x):
     print(f"  [{label}]  MSE(u)={mse_u:.3e}  RelMSE(u)={rel_u:.3e}  MSE(f)={mse_f:.3e}  RelMSE(f)={rel_f:.3e}")
 
 
-import matplotlib.pyplot as plt
-import torch
 
 # ── Helper ────────────────────────────────────────────────────────────────────
 def _to_np(t):
