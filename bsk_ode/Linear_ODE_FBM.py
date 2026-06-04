@@ -470,6 +470,12 @@ def evaluate_solution_from_beta_method1(
     Given kernel operators Ku2, Kup, Ku and coefficients beta,
     reconstruct u, u', u'' on the grid x.
     """
+    print(f"  Ku2.dtype  = {Ku2.dtype}")
+    print(f"  Kup.dtype  = {Kup.dtype}")
+    print(f"  Ku.dtype   = {Ku.dtype}")
+    print(f"  x.dtype    = {x.dtype}")
+    print(f"  beta.dtype = {beta.dtype}")
+    
     x0 = x[0]
 
     u_dd = Ku2 @ beta
