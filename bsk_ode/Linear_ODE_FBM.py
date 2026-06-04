@@ -17,6 +17,16 @@ from torch import cumulative_trapezoid
 import keras_sig
 from keras_sig import SigLayer
 
+
+# Cell 3 - seed
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
 def f_forcing_fbm(x: torch.Tensor, hurst: float = 0.2) -> torch.Tensor:
     """Fractional Brownian motion on [a,b] using fbm (Davies–Harte)."""
     N = x.numel()
