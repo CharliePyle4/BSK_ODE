@@ -470,12 +470,6 @@ def evaluate_solution_from_beta_method1(
     Given kernel operators Ku2, Kup, Ku and coefficients beta,
     reconstruct u, u', u'' on the grid x.
     """
-    print(f"  Ku2.dtype  = {Ku2.dtype}")
-    print(f"  Kup.dtype  = {Kup.dtype}")
-    print(f"  Ku.dtype   = {Ku.dtype}")
-    print(f"  x.dtype    = {x.dtype}")
-    print(f"  beta.dtype = {beta.dtype}")
-
     x0 = x[0]
 
     u_dd = Ku2 @ beta
@@ -2432,3 +2426,120 @@ def plot_m1_branched_full_sidebyside(x_full, forcing_full, u_ref_full,
     plt.suptitle('Method 1 Branched NN — Full Path (Train + Test)', fontsize=13)
     plt.tight_layout()
     plt.show()
+
+
+
+
+# ============================================================
+# Full-path assembly + error reporting
+# ============================================================
+
+def assemble_full_path_results(
+    N_train,
+    x, x_test, forcing,
+    u_nb_m1,  f_pred_nb_m1,  u_test_nb_m1,  f_test_pred_nb_m1,
+    u_tl_m1,  f_pred_tl_m1,  u_test_tl_m1,  f_test_pred_tl_m1,
+    u_sig_m1, f_pred_sig_m1, u_test_sig_m1, f_test_pred_sig_m1,
+    u_nb_m2,  f_pred_nb_m2,  u_test_nb_m2,  f_test_pred_nb_m2,
+    u_tl_m2,  f_pred_tl_m2,  u_test_tl_m2,  f_test_pred_tl_m2,
+    u_sig_m2, f_pred_sig_m2, u_test_sig_m2, f_test_pred_sig_m2,
+    ya, ypa, k1, k2,
+):
+    """
+    Concatenate train + test tensors into full-path tensors and
+    compute the true Method 2 RHS targets for both the full and
+    test-only grids.
+
+    Returns a dict with keys:
+        u_nb_m1, f_pred_nb_m1,  u_tl_m1, f_pred_tl_m1,
+        u_sig_m1, f_pred_sig_m1,
+        u_nb_m2, f_pred_nb_m2,  u_tl_m2, f_pred_tl_m2,
+        u_sig_m2, f_pred_sig_m2,
+        rhs_m2_full, rhs_m2_test
+    """
+    def cat(train, test):
+        return torch.cat([train, test[N_train:]], dim=0)
+
+    return dict(
+        u_nb_m1        = cat(u_nb_m1,   u_test_nb_m1),
+        f_pred_nb_m1   = cat(f_pred_nb_m1,  f_test_pred_nb_m1),
+        u_tl_m1        = cat(u_tl_m1,   u_test_tl_m1),
+        f_pred_tl_m1   = cat(f_pred_tl_m1,  f_test_pred_tl_m1),
+        u_sig_m1       = cat(u_sig_m1,  u_test_sig_m1),
+        f_pred_sig_m1  = cat(f_pred_sig_m1, f_test_pred_sig_m1),
+        u_nb_m2        = cat(u_nb_m2,   u_test_nb_m2),
+        f_pred_nb_m2   = cat(f_pred_nb_m2,  f_test_pred_nb_m2),
+        u_tl_m2        = cat(u_tl_m2,   u_test_tl_m2),
+        f_pred_tl_m2   = cat(f_pred_tl_m2,  f_test_pred_tl_m2),
+        u_sig_m2       = cat(u_sig_m2,  u_test_sig_m2),
+        f_pred_sig_m2  = cat(f_pred_sig_m2, f_test_pred_sig_m2),
+        rhs_m2_full    = rhs_method2(f=forcing,            x=x,      ua=ya, upa=ypa, k1=k1, k2=k2),
+        rhs_m2_test    = rhs_method2(f=forcing[N_train:],  x=x_test, ua=ya, upa=ypa, k1=k1, k2=k2),
+    )
+
+
+def print_all_errors(
+    split_label,
+    x, u_ref, forcing,
+    u_nb_m1,  f_pred_nb_m1,
+    u_tl_m1,  f_pred_tl_m1,
+    u_sig_m1, f_pred_sig_m1,
+    u_nb_m2,  f_pred_nb_m2,
+    u_tl_m2,  f_pred_tl_m2,
+    u_sig_m2, f_pred_sig_m2,
+    rhs_m2,
+):
+    """
+    Print the full error table (variant errors, % improvement vs
+    non-branched baseline, Method 1 vs Method 2 solution improvement)
+    for a given split.  split_label is e.g. 'FULL (train+test)' or
+    'TEST ONLY'.
+
+    Returns a dict with keys nb_m1, tl_m1, sig_m1, nb_m2, tl_m2,
+    sig_m2, each being the get_errors dict for that variant.
+    """
+    print(f"\nComparing ALL variants on {split_label}: "
+          "non-branched, t-lift, branched | method 1 vs method 2")
+
+    print(f"\n--- Method 1 ({split_label}) ---")
+    print_variant_errors("Non-branched", u_nb_m1,  f_pred_nb_m1,  u_ref, forcing, x)
+    print_variant_errors("t-lift      ", u_tl_m1,  f_pred_tl_m1,  u_ref, forcing, x)
+    print_variant_errors("Branched    ", u_sig_m1, f_pred_sig_m1, u_ref, forcing, x)
+
+    print(f"\n--- Method 2 ({split_label}) ---")
+    print_variant_errors("Non-branched", u_nb_m2,  f_pred_nb_m2,  u_ref, rhs_m2, x)
+    print_variant_errors("t-lift      ", u_tl_m2,  f_pred_tl_m2,  u_ref, rhs_m2, x)
+    print_variant_errors("Branched    ", u_sig_m2, f_pred_sig_m2, u_ref, rhs_m2, x)
+
+    nb_m1  = get_errors(u_nb_m1,  f_pred_nb_m1,  u_ref, forcing)
+    tl_m1  = get_errors(u_tl_m1,  f_pred_tl_m1,  u_ref, forcing)
+    sig_m1 = get_errors(u_sig_m1, f_pred_sig_m1, u_ref, forcing)
+
+    print(f"\n--- Method 1 ({split_label}): % improvement vs Non-branched (positive = better) ---")
+    print("  [Non-branched]  (baseline)")
+    print_pct_improvement("t-lift      ", tl_m1,  nb_m1)
+    print_pct_improvement("Branched    ", sig_m1, nb_m1)
+
+    nb_m2  = get_errors(u_nb_m2,  f_pred_nb_m2,  u_ref, rhs_m2)
+    tl_m2  = get_errors(u_tl_m2,  f_pred_tl_m2,  u_ref, rhs_m2)
+    sig_m2 = get_errors(u_sig_m2, f_pred_sig_m2, u_ref, rhs_m2)
+
+    print(f"\n--- Method 2 ({split_label}): % improvement vs Non-branched (positive = better) ---")
+    print("  [Non-branched]  (baseline)")
+    print_pct_improvement("t-lift      ", tl_m2,  nb_m2)
+    print_pct_improvement("Branched    ", sig_m2, nb_m2)
+
+    print(f"\n--- Method 1 vs Method 2 ({split_label}): % solution improvement "
+          "(positive = Method 1 better) ---")
+    for lbl, e_m1, e_m2 in [
+        ("Non-branched", nb_m1,  nb_m2),
+        ("t-lift      ", tl_m1,  tl_m2),
+        ("Branched    ", sig_m1, sig_m2),
+    ]:
+        def pct(v1, v2): return 100.0 * (v2 - v1) / (abs(v2) + 1e-12)
+        print(f"  [{lbl}]"
+              f"  MSE(u)={pct(e_m1['mse_u'], e_m2['mse_u']):+.1f}%"
+              f"  Rel(u)={pct(e_m1['rel_u'], e_m2['rel_u']):+.1f}%")
+
+    return dict(nb_m1=nb_m1, tl_m1=tl_m1, sig_m1=sig_m1,
+                nb_m2=nb_m2, tl_m2=tl_m2, sig_m2=sig_m2)
