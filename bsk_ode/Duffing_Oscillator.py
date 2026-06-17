@@ -678,7 +678,7 @@ def solve_signature_kernel_non_branched_method1(x, f,
     return u, f_pred_final
 
 
-# === Branched (extended‑path) signature‑kernel solver ===
+'''# === Branched (extended‑path) signature‑kernel solver ===
 def solve_signature_kernel_branched_method1(x, f,
                                     k1, k2, k3,
                                     ua, upa,
@@ -855,8 +855,199 @@ def solve_signature_kernel_branched_method1(x, f,
         print(f"Overall true final loss={final_loss:.3e}")
 
     return u, snapshots, f_pred_final, path_ext
+'''
 
 
+# === Branched (extended‑path) signature‑kernel solver ===
+def solve_signature_kernel_branched_method1(x, f,
+                                    k1, k2, k3,
+                                    ua, upa,
+                                    adam_iters, adam_lr,
+                                    ADAM_lambda_model, ADAM_lambda_shuffle,
+                                    snapshot_count, hidden_dims,
+                                    activation_cls, extensions,
+                                    adam_use_scheduler, adam_sched_factor,
+                                    adam_sched_patience,
+                                    depth, rbf_sigma,
+                                    beta_opt_method: str = "l-bfgs",
+                                    beta_iterations: int = 500,
+                                    kernel_type: str = "rbf",
+                                    norm_scheme: str = "none",
+                                    norm_kwargs: dict | None = None,
+                                    beta_solve_every: int = 1,
+                                    beta_min_iterations: int = 20,
+                                    beta_ramp_portion: float = 0.3,
+                                    ):
+
+    if norm_kwargs is None:
+        norm_kwargs = {}
+
+    # Build extension network
+    path_ext = PathExtension(
+        input_dim=2,
+        output_dim=extensions,
+        hidden_dims=hidden_dims,
+        activation_cls=activation_cls
+    ).to(device, dtype=torch.float64)
+
+    path_ext = torch.compile(path_ext)
+
+    # Optimizer (Adam) over extension net parameters only
+    snapshots = []
+    opt = torch.optim.Adam(
+        list(path_ext.parameters()),
+        lr=adam_lr
+    )
+
+    # Optional LR scheduler
+    scheduler = None
+    if adam_use_scheduler:
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt,
+            mode="min",
+            factor=adam_sched_factor,
+            patience=adam_sched_patience,
+        )
+
+    # Build the base path
+    X = torch.stack([x, f], dim=1)
+
+    # Snapshot schedule for Adam phase
+    num_snaps_adam = snapshot_count
+    adam_snapshot_epochs = sorted(set(
+        int(i) for i in torch.linspace(1, adam_iters, num_snaps_adam)
+    ))
+    if 1 in adam_snapshot_epochs:
+        adam_snapshot_epochs.remove(1)
+
+    beta_prev = None  # warm-start: reuse beta from previous Adam iteration
+
+    # ---------- Adam phase (jointly train extension + beta_w) ----------
+    for it in range(1, adam_iters + 1):
+        opt.zero_grad()
+
+        # Compute extensions and shuffle loss
+        out_ext = path_ext(X)
+        shuffle_loss = shuffle_loss_function(out_ext)
+
+        # Build extended path
+        X_ext = torch.cat([X, out_ext], dim=1)  # (T, 2+extensions) directly
+
+        # Signatures of extended path
+        X_ext_sig = computesignatures(X_ext, depth)
+
+        # Normalization on signatures of extended path (if any)
+        X_ext_sig_norm = apply_signature_normalization(
+            X_ext_sig, depth=depth, dim=2 + extensions,
+            scheme=norm_scheme, **norm_kwargs
+        )
+
+        # Kernel from normalized extended signatures
+        Ksig = build_kernel_from_signatures(
+            X_ext_sig_norm, sigma=rbf_sigma, kernel_type=kernel_type
+        )
+
+        # Build operators once
+        K_stack = build_kernel_operators_method1(Ksig, x)
+
+        # Decide whether to re-solve beta this iteration
+        if (it == 1) or (it % beta_solve_every == 0):
+            # Ramp LBFGS iterations from beta_min_iterations -> beta_iterations
+            progress = min(1.0, it / (adam_iters * beta_ramp_portion))
+            lbfgs_iters = int(
+                beta_min_iterations
+                + (beta_iterations - beta_min_iterations) * progress
+            )
+
+            # Beta solve on detached K_stack — avoids double-backward
+            K_stack_detached = K_stack.detach()
+            beta_w, u_tmp, _ = solve_betas_method1(
+                K_stack=K_stack_detached,
+                f=f,
+                x=x,
+                ua=ua,
+                upa=upa,
+                k1=k1,
+                k2=k2,
+                k3=k3,
+                beta_init=beta_prev,
+                max_iter=lbfgs_iters,
+                method=beta_opt_method,
+            )
+
+            beta_prev = beta_w.detach().clone()
+        else:
+            # Reuse previous beta; no LBFGS this step
+            beta_w = beta_prev
+
+        # Recompute f_pred through live K_stack so pde_loss trains path_ext
+        z = K_stack @ beta_w           # uses non-detached K_stack
+        u_tmp = ua + upa * (x - x[0]) + z[2]
+        f_pred = z[0] + k1 * (upa + z[1]) + k2 * u_tmp + k3 * u_tmp**3
+
+        pde_loss = forcing_loss(f, f_pred)
+
+        # Total loss (PDE + shuffle)
+        loss = ADAM_lambda_model * pde_loss + ADAM_lambda_shuffle * shuffle_loss
+        loss.backward()
+        opt.step()
+
+        # Scheduler step
+        if scheduler is not None:
+            scheduler.step(loss.detach())
+
+        # Logging and snapshots
+        if it % 50 == 0:
+            print(f"[Adam {it:04d}] loss={loss.item():.3e}, "
+                  f"PDE={pde_loss.item():.3e}, "
+                  f"shuffle={shuffle_loss.item():.3e}")
+
+        if it in adam_snapshot_epochs:
+            snapshots.append({
+                "phase": "Adam",
+                "iter": it,
+                "u": u_tmp.detach().clone(),
+                "f_pred": f_pred.detach().clone(),
+            })
+    # ---------- Final evaluation ----------
+    with torch.no_grad():
+        X_final = torch.stack([x, f], dim=1)
+        out_ext_final = path_ext(X_final)
+
+
+        X_ext_final = torch.cat([X_final, out_ext_final], dim=1)
+
+        X_ext_sig_final = computesignatures(X_ext_final, depth)
+        X_ext_sig_final_norm = apply_signature_normalization(
+            X_ext_sig_final, depth=depth, dim=2 + extensions,
+            scheme=norm_scheme, **norm_kwargs
+        )
+
+
+
+        Ksig_final = build_kernel_from_signatures(
+            X_ext_sig_final_norm, sigma=rbf_sigma, kernel_type=kernel_type
+        )
+        K_stack_final = build_kernel_operators_method1(Ksig_final, x)
+
+        beta_w, u, f_pred_final = solve_betas_method1(
+            K_stack=K_stack_final,
+            f=f,
+            x=x,
+            ua=ua,
+            upa=upa,
+            k1=k1,
+            k2=k2,
+            k3=k3,
+            beta_init=None,
+            max_iter=beta_iterations,
+            method=beta_opt_method,
+        )
+
+        final_loss = forcing_loss(f, f_pred_final)
+        print(f"Overall true final loss={final_loss:.3e}")
+
+    return u, snapshots, f_pred_final, path_ext
 
 
 def test_nonbranched_method1(
