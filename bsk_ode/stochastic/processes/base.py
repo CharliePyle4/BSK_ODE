@@ -4,11 +4,9 @@ from abc import abstractmethod
 
 import numpy as np
 
-from stochastic import random
-from stochastic.utils import generate_times
-from stochastic.utils.validation import check_positive_integer
-from stochastic.utils.validation import check_positive_number
-
+from .. import random
+from ..utils import generate_times
+from ..utils.validation import check_positive_integer, check_positive_number
 
 class BaseProcess(ABC):
     def __init__(self, rng=None):
