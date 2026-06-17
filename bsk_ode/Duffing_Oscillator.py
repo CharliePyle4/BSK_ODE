@@ -353,13 +353,11 @@ def apply_signature_normalization(sigs_flat: torch.Tensor,
 import torch.nn.functional as F
 
 def build_kernel_operators_method1(Ksig, x):
-    # No .clone() — Ku2 IS Ksig (never mutated)
-    I1 = torch.cumulative_trapezoid(Ksig, x, dim=0)   # (N-1, N)
-    Kup = F.pad(I1, (0, 0, 1, 0))                     # (N, N) — zero-pad top row
-    I2 = torch.cumulative_trapezoid(Kup, x, dim=0)
-    Ku = F.pad(I2, (0, 0, 1, 0))
-    return Ksig, Kup, Ku                               # Ku2 = Ksig directly
-
+    I1  = torch.cumulative_trapezoid(Ksig, x, dim=0)
+    Kup = F.pad(I1, (0, 0, 1, 0))
+    I2  = torch.cumulative_trapezoid(Kup, x, dim=0)
+    Ku  = F.pad(I2, (0, 0, 1, 0))
+    return torch.stack([Ksig, Kup, Ku])   # (3, N, N)
 '''
 def solve_betas_method1(Ksig: torch.Tensor,
                 f: torch.Tensor,
@@ -443,36 +441,30 @@ def solve_betas_method1(Ksig: torch.Tensor,
 
 '''
 
-def solve_betas_method1(Ksig, f, x, ua, upa, k1, k2, k3,
+def solve_betas_method1(K_stack, f, x, ua, upa, k1, k2, k3,
                         beta_init=None, max_iter=500, method="l-bfgs"):
-    Ku2, Kup, Ku = build_kernel_operators_method1(Ksig, x)
-    N = Ksig.shape[0]
+    # K_stack: (3, N, N)
+    N = K_stack.shape[-1]
     x_shifted = x - x[0]
 
-    beta = (torch.zeros(N, dtype=Ksig.dtype, device=Ksig.device)
+    beta = (torch.zeros(N, dtype=x.dtype, device=x.device)
             if beta_init is None
-            else beta_init.clone().detach().to(Ksig.device).reshape(-1))
+            else beta_init.to(x.device).reshape(-1).clone())
     beta.requires_grad_(True)
 
-    K_stack = torch.stack([Ku2, Kup, Ku])  # (3, N, N)
-
     optimizer = torch.optim.LBFGS(
-        [beta],
-        max_iter=max_iter,
-        tolerance_grad=1e-9,
-        tolerance_change=1e-12,
-        history_size=20,
-        line_search_fn="strong_wolfe",
+        [beta], max_iter=max_iter,
+        tolerance_grad=1e-9, tolerance_change=1e-12,
+        history_size=20, line_search_fn="strong_wolfe",
     )
 
     def closure():
         optimizer.zero_grad()
-        z = K_stack @ beta
+        z = K_stack @ beta          # (3, N)
         u_dd = z[0]
         u_p  = upa + z[1]
         u    = ua + upa * x_shifted + z[2]
-        f_pred = u_dd + k1 * u_p + k2 * u + k3 * u**3
-        loss = 0.5 * ((f_pred - f) ** 2).sum()
+        loss = 0.5 * ((u_dd + k1*u_p + k2*u + k3*u**3 - f) ** 2).sum()
         loss.backward()
         return loss
 
@@ -480,12 +472,12 @@ def solve_betas_method1(Ksig, f, x, ua, upa, k1, k2, k3,
 
     with torch.no_grad():
         z = K_stack @ beta.detach()
-        u_dd = z[0]; u_p = upa + z[1]; u = ua + upa * x_shifted + z[2]
-        f_pred = u_dd + k1 * u_p + k2 * u + k3 * u**3
+        u_dd = z[0]
+        u_p  = upa + z[1]
+        u    = ua + upa * x_shifted + z[2]
+        f_pred = u_dd + k1*u_p + k2*u + k3*u**3
 
     return beta.detach(), u, f_pred
-
-
 
 def build_kernel_from_different_signatures(
     sigs_flat1: torch.Tensor,
@@ -554,7 +546,7 @@ def apply_signature_normalization_pair(sigs_train: torch.Tensor,
     else:
         raise ValueError(f"Unknown normalization scheme '{scheme}'")
 
-def evaluate_solution_from_beta_method1(
+'''def evaluate_solution_from_beta_method1(
     Ku2: torch.Tensor,
     Kup: torch.Tensor,
     Ku: torch.Tensor,
@@ -573,6 +565,13 @@ def evaluate_solution_from_beta_method1(
     u_p  = upa + Kup @ beta
     u    = ua + upa * (x - x0) + Ku @ beta
 
+    return u, u_p, u_dd'''
+
+def evaluate_solution_from_beta_method1(K_stack, x, beta, ua, upa):
+    z    = K_stack @ beta          # (3, N) — one batched GEMV
+    u_dd = z[0]
+    u_p  = upa + z[1]
+    u    = ua + upa * (x - x[0]) + z[2]
     return u, u_p, u_dd
 
 def evaluate_forcing_from_solution_method1(
@@ -657,8 +656,10 @@ def solve_signature_kernel_non_branched_method1(x, f,
 
         Ksig = build_kernel_from_signatures(X_sig_norm, sigma=rbf_sigma, kernel_type=kernel_type)
 
+        K_stack = build_kernel_operators_method1(Ksig, x)
+
         beta_w, u, f_pred_final = solve_betas_method1(
-            Ksig=Ksig,
+            K_stack=K_stack,
             f=f,
             x=x,
             ua=ua,
@@ -746,8 +747,7 @@ def solve_signature_kernel_branched_method1(x, f,
         shuffle_loss = shuffle_loss_function(out_ext)
 
         # Build extended path
-        stack = torch.cat([X.unsqueeze(0), out_ext.unsqueeze(0)], dim=2)
-        X_ext = stack.squeeze(0)
+        X_ext = torch.cat([X, out_ext], dim=1)  # (T, 2+extensions) directly
 
         # Signatures of extended path
         X_ext_sig = computesignatures(X_ext, depth)
@@ -758,13 +758,19 @@ def solve_signature_kernel_branched_method1(x, f,
             scheme=norm_scheme, **norm_kwargs
         )
 
+
         # Kernel from normalized extended signatures
         Ksig = build_kernel_from_signatures(
             X_ext_sig_norm, sigma=rbf_sigma, kernel_type=kernel_type
         )
 
-        beta_w, u_tmp, f_pred = solve_betas_method1(
-            Ksig=Ksig,
+        # Build operators once
+        K_stack = build_kernel_operators_method1(Ksig, x)
+        K_stack_detached = K_stack.detach()
+
+        # Beta solve on detached K_stack — avoids double-backward
+        beta_w, u_tmp, _ = solve_betas_method1(
+            K_stack=K_stack_detached,
             f=f,
             x=x,
             ua=ua,
@@ -772,14 +778,20 @@ def solve_signature_kernel_branched_method1(x, f,
             k1=k1,
             k2=k2,
             k3=k3,
-            beta_init=beta_prev,        # warm-start from last iteration
+            beta_init=beta_prev,
             max_iter=beta_iterations,
             method=beta_opt_method,
         )
 
-        beta_prev = beta_w.detach().clone()  # save for next iteration
+        beta_prev = beta_w.detach().clone()
+
+        # Recompute f_pred through live K_stack so pde_loss trains path_ext
+        z = K_stack @ beta_w           # uses non-detached K_stack
+        u_tmp = ua + upa * (x - x[0]) + z[2]
+        f_pred = z[0] + k1 * (upa + z[1]) + k2 * u_tmp + k3 * u_tmp**3
 
         pde_loss = forcing_loss(f, f_pred)
+
 
         # Total loss (PDE + shuffle)
         loss = ADAM_lambda_model * pde_loss + ADAM_lambda_shuffle * shuffle_loss
@@ -809,10 +821,8 @@ def solve_signature_kernel_branched_method1(x, f,
         X_final = torch.stack([x, f], dim=1)
         out_ext_final = path_ext(X_final)
 
-        stack_final = torch.cat(
-            [X_final.unsqueeze(0), out_ext_final.unsqueeze(0)], dim=2
-        )
-        X_ext_final = stack_final.squeeze(0)
+
+        X_ext_final = torch.cat([X_final, out_ext_final], dim=1)
 
         X_ext_sig_final = computesignatures(X_ext_final, depth)
         X_ext_sig_final_norm = apply_signature_normalization(
@@ -820,12 +830,15 @@ def solve_signature_kernel_branched_method1(x, f,
             scheme=norm_scheme, **norm_kwargs
         )
 
+
+
         Ksig_final = build_kernel_from_signatures(
             X_ext_sig_final_norm, sigma=rbf_sigma, kernel_type=kernel_type
         )
+        K_stack_final = build_kernel_operators_method1(Ksig_final, x)
 
         beta_w, u, f_pred_final = solve_betas_method1(
-            Ksig=Ksig_final,
+            K_stack=K_stack_final,
             f=f,
             x=x,
             ua=ua,
@@ -833,7 +846,7 @@ def solve_signature_kernel_branched_method1(x, f,
             k1=k1,
             k2=k2,
             k3=k3,
-            beta_init=None,           # fresh solve for the final clean result
+            beta_init=None,
             max_iter=beta_iterations,
             method=beta_opt_method,
         )
@@ -842,6 +855,7 @@ def solve_signature_kernel_branched_method1(x, f,
         print(f"Overall true final loss={final_loss:.3e}")
 
     return u, snapshots, f_pred_final, path_ext
+
 
 
 
@@ -877,8 +891,10 @@ def test_nonbranched_method1(
         Ksig_train = build_kernel_from_signatures(
             X_sig_norm_train, sigma=rbf_sigma, kernel_type=kernel_type
         )
+        K_stack_train = build_kernel_operators_method1(Ksig_train, x_train)
+
         beta_w, u_pred_train, f_pred_train = solve_betas_method1(
-            Ksig=Ksig_train, f=f_train, x=x_train, ua=ua, upa=upa,
+            K_stack=K_stack_train, f=f_train, x=x_train, ua=ua, upa=upa,
             k1=k1, k2=k2, k3=k3,
             beta_init=None,
             max_iter=beta_iterations,
@@ -902,6 +918,7 @@ def test_nonbranched_method1(
                     X_sig_train, depth=depth, dim=2,
                     scheme=norm_scheme, **norm_kwargs
                 )
+                
                 Ksig_train = build_kernel_from_signatures(
                     X_sig_norm_train, sigma=rbf_sigma, kernel_type=kernel_type
                 )
@@ -916,8 +933,10 @@ def test_nonbranched_method1(
                 beta_init[:n_copy] = beta_old[:n_copy]
                 # ------------------------------------------------------
 
+                K_stack_train = build_kernel_operators_method1(Ksig_train, x_retrain)
+
                 beta_w, u_pred_train, f_pred_train = solve_betas_method1(
-                    Ksig=Ksig_train, f=f_retrain, x=x_retrain, ua=ua, upa=upa,
+                    K_stack=K_stack_train, f=f_retrain, x=x_retrain, ua=ua, upa=upa,
                     k1=k1, k2=k2, k3=k3,
                     beta_init=beta_init,          # padded warm start
                     max_iter=beta_iterations,
@@ -942,14 +961,16 @@ def test_nonbranched_method1(
                 X_sig_curr_norm, X_sig_train_norm_pair,
                 sigma=rbf_sigma, kernel_type=kernel_type
             )
-            Ku2_curr, Kup_curr, Ku_curr = build_kernel_operators_method1(
-                Ksig_curr_train, x_curr
-            )
+
+            K_stack_curr = build_kernel_operators_method1(Ksig_curr_train, x_curr)
 
             # Evaluate on current grid
             u_curr, u_p_curr, u_dd_curr = evaluate_solution_from_beta_method1(
-                Ku2_curr, Kup_curr, Ku_curr, x_curr, beta_w, ua, upa
+                K_stack_curr, x_curr, beta_w, ua, upa
             )
+
+
+
             f_curr_pred = evaluate_forcing_from_solution_method1(
                 u_curr, u_p_curr, u_dd_curr, k1, k2, k3
             )
@@ -968,6 +989,9 @@ def test_nonbranched_method1(
     print(f"final forcing loss (train+test, last beta): {final_loss.item():.3e}")
 
     return u_pred_full, f_pred_full
+
+
+
 
 def test_branched_NN_method1(
     x_train: torch.Tensor,
@@ -1000,16 +1024,22 @@ def test_branched_NN_method1(
             X_sig_train, depth=depth, dim=2,
             scheme=norm_scheme, **norm_kwargs
         )
+
         Ksig_train = build_kernel_from_signatures(
             X_sig_norm_train, sigma=rbf_sigma, kernel_type=kernel_type
         )
+        K_stack_train = build_kernel_operators_method1(Ksig_train, x_train)
+
         beta_w, u_pred_train, f_pred_train = solve_betas_method1(
-            Ksig=Ksig_train, f=f_train, x=x_train, ua=ua, upa=upa,
+            K_stack=K_stack_train, f=f_train, x=x_train, ua=ua, upa=upa,
             k1=k1, k2=k2, k3=k3,
             beta_init=None,
             max_iter=beta_iterations,
             method=beta_opt_method,
         )
+
+
+
         u_pred_full = u_pred_train.clone()
         f_pred_full = f_pred_train.clone()
 
@@ -1029,6 +1059,7 @@ def test_branched_NN_method1(
                     X_sig_train, depth=depth, dim=2,
                     scheme=norm_scheme, **norm_kwargs
                 )
+                
                 Ksig_train = build_kernel_from_signatures(
                     X_sig_norm_train, sigma=rbf_sigma, kernel_type=kernel_type
                 )
@@ -1043,8 +1074,10 @@ def test_branched_NN_method1(
                 beta_init[:n_copy] = beta_old[:n_copy]
                 # ------------------------------------------------------
 
+                K_stack_train = build_kernel_operators_method1(Ksig_train, x_retrain)
+
                 beta_w, u_pred_train, f_pred_train = solve_betas_method1(
-                    Ksig=Ksig_train, f=f_retrain, x=x_retrain, ua=ua, upa=upa,
+                    K_stack=K_stack_train, f=f_retrain, x=x_retrain, ua=ua, upa=upa,
                     k1=k1, k2=k2, k3=k3,
                     beta_init=beta_init,        # padded warm start
                     max_iter=beta_iterations,
@@ -1070,14 +1103,15 @@ def test_branched_NN_method1(
                 X_sig_curr_norm, X_sig_train_norm_pair,
                 sigma=rbf_sigma, kernel_type=kernel_type
             )
-            Ku2_curr, Kup_curr, Ku_curr = build_kernel_operators_method1(
-                Ksig_curr_train, x_curr
-            )
+
+            K_stack_curr = build_kernel_operators_method1(Ksig_curr_train, x_curr)
 
             # Evaluate on current grid
             u_curr, u_p_curr, u_dd_curr = evaluate_solution_from_beta_method1(
-                Ku2_curr, Kup_curr, Ku_curr, x_curr, beta_w, ua, upa
+                K_stack_curr, x_curr, beta_w, ua, upa
             )
+
+
             f_curr_pred = evaluate_forcing_from_solution_method1(
                 u_curr, u_p_curr, u_dd_curr, k1, k2, k3
             )
