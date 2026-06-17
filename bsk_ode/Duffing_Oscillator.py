@@ -408,7 +408,7 @@ def solve_betas_method1(Ksig: torch.Tensor,
         beta0,
         method=method,
         max_iter=max_iter,
-        tol=1e-12,
+        tol=1e-8,
     )
 
 
@@ -638,6 +638,8 @@ def solve_signature_kernel_branched_method1(x, f,
         hidden_dims=hidden_dims,
         activation_cls=activation_cls
     ).to(device, dtype=torch.float64)
+
+    path_ext = torch.compile(path_ext)
 
     # Optimizer (Adam) over extension net parameters only
     snapshots = []
