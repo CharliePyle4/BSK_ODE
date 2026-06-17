@@ -3,8 +3,8 @@ from functools import lru_cache
 
 import numpy as np
 
-from stochastic.processes.base import BaseTimeProcess
-from stochastic.utils.validation import check_positive_integer
+from ..base import BaseTimeProcess
+from ...utils.validation import check_positive_integer
 
 
 def _fgn_autocovariance(hurst, n):
