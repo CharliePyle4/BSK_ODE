@@ -16,7 +16,6 @@ import torchmin
 from torch import nn
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
-from fbm import FBM
 from torchmin import least_squares
 from torchmin import minimize
 from torch import cumulative_trapezoid  # or torch.cumulative_trapezoid in newer versions
@@ -28,7 +27,6 @@ from keras_sig import SigLayer
 import math
 from typing import Tuple
 import torch
-from fbm import FBM
 
 
 # Cell 3 - seed

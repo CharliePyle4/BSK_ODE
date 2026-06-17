@@ -17,7 +17,6 @@ import torchmin
 from torch import nn
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
-from fbm import FBM
 from torchmin import least_squares
 from torchmin import minimize
 from torch import cumulative_trapezoid
