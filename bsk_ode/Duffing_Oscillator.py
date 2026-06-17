@@ -329,7 +329,7 @@ def apply_signature_normalization(sigs_flat: torch.Tensor,
 
 
 
-def build_kernel_operators_method1(Ksig: torch.Tensor,
+'''def build_kernel_operators_method1(Ksig: torch.Tensor,
                            x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Vectorized construction of Ku2, Kup, Ku from Ksig.
@@ -348,7 +348,19 @@ def build_kernel_operators_method1(Ksig: torch.Tensor,
     Ku = I2
 
     return Ku2, Kup, Ku
+'''
 
+import torch.nn.functional as F
+
+def build_kernel_operators_method1(Ksig, x):
+    # No .clone() — Ku2 IS Ksig (never mutated)
+    I1 = torch.cumulative_trapezoid(Ksig, x, dim=0)   # (N-1, N)
+    Kup = F.pad(I1, (0, 0, 1, 0))                     # (N, N) — zero-pad top row
+    I2 = torch.cumulative_trapezoid(Kup, x, dim=0)
+    Ku = F.pad(I2, (0, 0, 1, 0))
+    return Ksig, Kup, Ku                               # Ku2 = Ksig directly
+
+'''
 def solve_betas_method1(Ksig: torch.Tensor,
                 f: torch.Tensor,
                 x: torch.Tensor,
@@ -380,6 +392,7 @@ def solve_betas_method1(Ksig: torch.Tensor,
     else:
         beta0 = beta_init.clone().detach().to(Ksig.device).reshape(-1)
 
+    """
     def forward(beta: torch.Tensor):
 
         z_u2 = Ku2 @ beta
@@ -393,6 +406,16 @@ def solve_betas_method1(Ksig: torch.Tensor,
         linear_term    = u_dd + k1 * u_p + k2 * u
         nonlinear_term = k3 * u**3
         f_pred = linear_term + nonlinear_term
+        return u, u_p, u_dd, f_pred
+    """
+    
+    def forward(beta):
+        # Stack operators: (3, N, N) @ (N,) -> (3, N) in one CUDA call
+        z = torch.stack([Ku2, Kup, Ku]) @ beta   # (3, N)
+        u_dd = z[0]
+        u_p  = upa + z[1]
+        u    = ua + upa * (x - x[0]) + z[2]
+        f_pred = u_dd + k1 * u_p + k2 * u + k3 * u**3
         return u, u_p, u_dd, f_pred
 
     def residual(beta: torch.Tensor) -> torch.Tensor:
@@ -418,6 +441,49 @@ def solve_betas_method1(Ksig: torch.Tensor,
     u, u_p, u_dd, f_pred = forward(beta_opt)
     return beta_opt, u, f_pred
 
+'''
+
+def solve_betas_method1(Ksig, f, x, ua, upa, k1, k2, k3,
+                        beta_init=None, max_iter=500, method="l-bfgs"):
+    Ku2, Kup, Ku = build_kernel_operators_method1(Ksig, x)
+    N = Ksig.shape[0]
+    x_shifted = x - x[0]
+
+    beta = (torch.zeros(N, dtype=Ksig.dtype, device=Ksig.device)
+            if beta_init is None
+            else beta_init.clone().detach().to(Ksig.device).reshape(-1))
+    beta.requires_grad_(True)
+
+    K_stack = torch.stack([Ku2, Kup, Ku])  # (3, N, N)
+
+    optimizer = torch.optim.LBFGS(
+        [beta],
+        max_iter=max_iter,
+        tolerance_grad=1e-9,
+        tolerance_change=1e-12,
+        history_size=20,
+        line_search_fn="strong_wolfe",
+    )
+
+    def closure():
+        optimizer.zero_grad()
+        z = K_stack @ beta
+        u_dd = z[0]
+        u_p  = upa + z[1]
+        u    = ua + upa * x_shifted + z[2]
+        f_pred = u_dd + k1 * u_p + k2 * u + k3 * u**3
+        loss = 0.5 * ((f_pred - f) ** 2).sum()
+        loss.backward()
+        return loss
+
+    optimizer.step(closure)
+
+    with torch.no_grad():
+        z = K_stack @ beta.detach()
+        u_dd = z[0]; u_p = upa + z[1]; u = ua + upa * x_shifted + z[2]
+        f_pred = u_dd + k1 * u_p + k2 * u + k3 * u**3
+
+    return beta.detach(), u, f_pred
 
 
 
@@ -990,7 +1056,6 @@ def test_branched_NN_method1(
             f_curr = torch.cat([f_train, f_test[:j]], dim=0)
             X_curr = torch.stack([x_curr, f_curr], dim=1)
             X_curr_branched = torch.cat([X_curr, pathextension(X_curr)], dim=1)
-            X_sig_curr = computesignatures(X_curr_branched, depth)
 
             # Compute signatures and normalize using training stats
             X_sig_curr = computesignatures(X_curr_branched, depth)
