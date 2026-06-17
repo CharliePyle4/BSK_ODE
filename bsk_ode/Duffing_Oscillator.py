@@ -18,12 +18,11 @@ import math
 import numpy as np
 import torchmin
 from torch import nn
-import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
-from fbm import FBM
 from torchmin import least_squares
 from torchmin import minimize
 from torch import cumulative_trapezoid
+from stochastic.processes.continuous import FractionalBrownianMotion
 
 import keras_sig
 from keras_sig import SigLayer
@@ -42,14 +41,22 @@ torch.backends.cudnn.benchmark     = False
 
 
 def f_forcing_fbm(x: torch.Tensor, hurst: float = 0.2) -> torch.Tensor:
-    """Fractional Brownian motion on [a,b] using fbm (Davies–Harte)."""
+    """Fractional Brownian motion on [a,b] using the stochastic library."""
     N = x.numel()
     a_ = float(x[0])
     b_ = float(x[-1])
     length = b_ - a_
 
-    f = FBM(n=N-1, hurst=hurst, length=length, method='daviesharte')
-    fbm_sample = f.fbm()
+    # Create a seeded random number generator for reproducibility.
+    # The 'stochastic' library uses the new numpy Generator API, which is not
+    # seeded by the legacy np.random.seed(). We create a new generator from
+    # the global SEED constant.
+    rng = np.random.default_rng(SEED)
+
+    fbm_gen = FractionalBrownianMotion(hurst=hurst, t=length, rng=rng)
+    # sample(N-1) generates N points for the interval [0, length].
+    fbm_sample = fbm_gen.sample(n=N-1)
+
     return torch.tensor(fbm_sample, dtype=x.dtype, device=x.device)
 
 
@@ -1881,4 +1888,3 @@ def plot_forcing_test_1x2(
 
     plt.tight_layout()
     plt.show()
-
