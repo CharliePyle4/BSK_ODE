@@ -27,16 +27,22 @@ torch.cuda.manual_seed_all(SEED)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
-def f_forcing_fbm(x: torch.Tensor, hurst: float = 0.2) -> torch.Tensor:
-    """Fractional Brownian motion on [a,b] using fbm (Davies–Harte)."""
-    N = x.numel()
-    a_ = float(x[0])
-    b_ = float(x[-1])
-    length = b_ - a_
+from .stochastic.processes.continuous import FractionalBrownianMotion
 
-    f = FBM(n=N-1, hurst=hurst, length=length, method='daviesharte')
-    fbm_sample = f.fbm()
-    return torch.tensor(fbm_sample, dtype=x.dtype, device=x.device)
+def f_forcing_fbm(x: torch.Tensor, hurst: float = 0.2) -> torch.Tensor:
+    """Fractional Brownian motion on [a,b] using stochastic (Davies–Harte)."""
+    N = x.numel()
+    length = float(x[-1]) - float(x[0])
+
+    rng = np.random.default_rng(SEED)
+    fbm_gen = FractionalBrownianMotion(hurst=hurst, t=length, rng=rng)
+
+    # sample returns N+1 points: B[0]=0, B[1]...B[N]
+    fbm_sample = fbm_gen.sample(n=N)
+    B = torch.tensor(fbm_sample, dtype=x.dtype, device=x.device)
+
+    # return the full path (N+1 points) trimmed to N to match x
+    return B[:N]
 
 def solve_linear_ivp(x_grid: torch.Tensor,
                   forcing_torch: torch.Tensor,
@@ -608,6 +614,12 @@ def shuffle_loss_residual(X_bar: torch.Tensor) -> torch.Tensor:
     R = deltas[:, None] * deltas[None, :] - (I + I.T)
     return R
 
+def init_path_extension_weights(m):
+    if isinstance(m, nn.Linear):
+        nn.init.xavier_uniform_(m.weight)
+        nn.init.zeros_(m.bias)
+
+
 
 # === Non‑branched (no extension) signature‑kernel solver ===
 def solve_signature_kernel_non_branched_method1(x, f,
@@ -725,6 +737,10 @@ def solve_signature_kernel_branched_method1(x, f,
         hidden_dims=hidden_dims,
         activation_cls=activation_cls
     ).to(device)
+
+    path_ext.apply(init_path_extension_weights)
+
+    path_ext = torch.compile(path_ext)
 
 
     # Optimizer (Adam) over both extension net and beta_w
@@ -968,6 +984,10 @@ def solve_signature_kernel_branched_method2(x, f,
         hidden_dims=hidden_dims,
         activation_cls=activation_cls
     ).to(device)
+
+    path_ext.apply(init_path_extension_weights)
+
+    path_ext = torch.compile(path_ext)
 
     snapshots = []
     opt = torch.optim.Adam(
