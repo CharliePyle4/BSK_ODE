@@ -13,6 +13,7 @@ import random
 import keras_sig
 from scipy.integrate import solve_ivp
 from torch import cumulative_trapezoid
+import numpy as np
 
 
 
