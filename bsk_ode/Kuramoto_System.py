@@ -503,6 +503,7 @@ def solve_signature_kernel_branched(
             kernel_type=kernel_type,
         )
 
+
         beta, theta_fit_T, dtheta_fit_T, lhs_fit_T, forcing_fit_T = solve_betas_kuramoto(
             Ksig=Ksig,
             forcing_true=forcing_true.T,
@@ -595,6 +596,9 @@ def solve_signature_kernel_branched(
             kernel_type=kernel_type,
         )
 
+        Ksig_detached = Ksig.detach()
+
+
         # -------- beta schedule (LBFGS work) --------
         if (it == 1) or (it % beta_solve_every == 0):
             progress = min(1.0, it / (adam_iters * beta_ramp_portion))
@@ -604,7 +608,7 @@ def solve_signature_kernel_branched(
             )
 
             beta_w, theta_fit_T, dtheta_fit_T, lhs_fit_T, forcing_fit_T = solve_betas_kuramoto(
-                Ksig=Ksig,
+                Ksig=Ksig_detached,
                 forcing_true=forcing_true.T,
                 x=t_grid,
                 theta0=theta0,
@@ -619,7 +623,7 @@ def solve_signature_kernel_branched(
         else:
             # Reuse previous beta; do a forward-only pass
             _, theta_fit_T, dtheta_fit_T, lhs_fit_T, forcing_fit_T = solve_betas_kuramoto(
-                Ksig=Ksig,
+                Ksig=Ksig_detached,
                 forcing_true=forcing_true.T,
                 x=t_grid,
                 theta0=theta0,
@@ -636,7 +640,18 @@ def solve_signature_kernel_branched(
         lhs_fit     = lhs_fit_T.T
         forcing_fit = forcing_fit_T.T
 
-        model_loss   = forcing_loss(forcing_true, forcing_fit)
+        # Adam gradient: recompute forcing_pred using the live Ksig (with graph)
+        # so that gradients flow back through path_ext
+        beta_fixed = beta_w.detach() if (it == 1 or it % beta_solve_every == 0) else beta_prev
+
+        Kp_live = Ksig.clone()
+        K_live  = cumtrapz_torch(Kp_live, t_grid)
+        dtheta_live = Kp_live @ beta_fixed
+        theta_live  = theta0.unsqueeze(0) + K_live @ beta_fixed
+        coupling_live = kuramoto_coupling(theta_live, K_coupling)
+        forcing_pred_live = dtheta_live - omega_vec.unsqueeze(0) - coupling_live
+
+        model_loss   = forcing_loss(forcing_true, forcing_pred_live.T)
         shuffle_loss = shuffle_loss_function(out_ext)
         total_loss   = adam_lambda_model * model_loss + adam_lambda_shuffle * shuffle_loss
 
