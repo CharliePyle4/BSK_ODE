@@ -24,6 +24,13 @@ def trapezoidal_cols(M, dt):
     out[1:] = torch.cumsum(trap, dim=0)
     return out
 
+def cumtrapz_torch(y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    dx   = x[1:] - x[:-1]
+    area = 0.5 * (y[1:] + y[:-1]) * dx
+    out  = torch.zeros_like(y)
+    out[1:] = torch.cumsum(area, dim=0)
+    return out
+
 def forcing_loss(true_forcing, approximated_forcing):
     residual = true_forcing - approximated_forcing
     loss = torch.mean(residual**2)
@@ -181,7 +188,11 @@ def solve_signature_kernel(x, f,
         X_sig = compute_signatures(X, depth)     # (T,D)
 
         if(normalize == True):
-            X_sig = normalize_signatures()
+            X_sig = normalize_signatures(
+                Z=X_sig,
+                depth=depth,
+                dim=X.shape[1],
+            )
 
         Ksig = build_kernel_from_signatures(X_sig)
 
