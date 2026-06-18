@@ -29,20 +29,27 @@ torch.backends.cudnn.benchmark = False
 
 from .stochastic.processes.continuous import FractionalBrownianMotion
 
+
+
 def f_forcing_fbm(x: torch.Tensor, hurst: float = 0.2) -> torch.Tensor:
-    """Fractional Brownian motion on [a,b] using stochastic (Davies–Harte)."""
+    """Fractional Brownian motion on [a,b] using the stochastic library."""
     N = x.numel()
-    length = float(x[-1]) - float(x[0])
+    a_ = float(x[0])
+    b_ = float(x[-1])
+    length = b_ - a_
 
+    # Create a seeded random number generator for reproducibility.
+    # The 'stochastic' library uses the new numpy Generator API, which is not
+    # seeded by the legacy np.random.seed(). We create a new generator from
+    # the global SEED constant.
     rng = np.random.default_rng(SEED)
+
     fbm_gen = FractionalBrownianMotion(hurst=hurst, t=length, rng=rng)
+    # sample(N-1) generates N points for the interval [0, length].
+    fbm_sample = fbm_gen.sample(n=N-1)
 
-    # sample returns N+1 points: B[0]=0, B[1]...B[N]
-    fbm_sample = fbm_gen.sample(n=N)
-    B = torch.tensor(fbm_sample, dtype=x.dtype, device=x.device)
+    return torch.tensor(fbm_sample, dtype=x.dtype, device=x.device)
 
-    # return the full path (N+1 points) trimmed to N to match x
-    return B[:N]
 
 def solve_linear_ivp(x_grid: torch.Tensor,
                   forcing_torch: torch.Tensor,
