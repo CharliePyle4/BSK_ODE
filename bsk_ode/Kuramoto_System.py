@@ -412,6 +412,12 @@ def solve_betas_kuramoto(
 
     return beta_opt, theta, dtheta_dt, lhs, forcing_pred
 
+def init_path_extension_weights(m):
+    if isinstance(m, nn.Linear):
+        nn.init.xavier_uniform_(m.weight)
+        nn.init.zeros_(m.bias)
+
+
 class PathExtension(nn.Module):
     def __init__(self,
                  input_dim: int,
@@ -491,58 +497,6 @@ def solve_signature_kernel_branched(
     # Base path: time + forcing
     X = torch.cat([t_grid.unsqueeze(1), forcing_true.T], dim=1)   # (T, 1+N)
 
-    # ---------------------- no-extension shortcut ---------------------- #
-    if extensions == 0:
-        X_sig = compute_signatures(X, depth)
-        if normalize:
-            X_sig = normalize_kernel_matrix(X_sig)
-
-        Ksig = build_kernel_from_signatures(
-            X_sig,
-            sigma=rbf_sigma,
-            kernel_type=kernel_type,
-        )
-
-
-        beta, theta_fit_T, dtheta_fit_T, lhs_fit_T, forcing_fit_T = solve_betas_kuramoto(
-            Ksig=Ksig,
-            forcing_true=forcing_true.T,
-            x=t_grid,
-            theta0=theta0,
-            omega=omega_vec,
-            K_coupling=K_coupling,
-            beta_init=None,
-            reg=beta_reg,
-            max_iter=max_beta_iter,
-            method=beta_method,
-        )
-
-        theta_fit   = theta_fit_T.T
-        dtheta_fit  = dtheta_fit_T.T
-        lhs_fit     = lhs_fit_T.T
-        forcing_fit = forcing_fit_T.T
-
-        final_loss = forcing_loss(forcing_true, forcing_fit)
-        print(f"branched model forcing match loss: {final_loss.item():.3e}")
-
-        snapshots = [{
-            "phase": "final",
-            "iter": 0,
-            "X_bar": X.detach().clone(),
-            "theta_fit": theta_fit.detach().clone(),
-            "forcing_fit": forcing_fit.detach().clone(),
-        }]
-
-        return (
-            theta_fit,
-            dtheta_fit,
-            lhs_fit,
-            forcing_fit,
-            beta,
-            X.detach(),
-            None,
-            snapshots,
-        )
 
     # ------------------------ branched (NN) case ------------------------ #
     path_ext = PathExtension(
@@ -551,6 +505,8 @@ def solve_signature_kernel_branched(
         hidden_dims=hidden_dims,
         activation_cls=activation_cls,
     ).to(device=device, dtype=dtype)
+
+    path_ext.apply(init_path_extension_weights)
 
     path_ext = torch.compile(path_ext)
 
@@ -578,6 +534,7 @@ def solve_signature_kernel_branched(
         snapshot_iters = []
 
     snapshots = []
+    training_history = []
     beta_prev = None
 
     for it in range(1, adam_iters + 1):
@@ -665,6 +622,16 @@ def solve_signature_kernel_branched(
         if scheduler is not None:
             scheduler.step(total_loss.detach())
 
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        training_history.append({
+            "iter": it,
+            "lr": float(current_lr),
+            "total_weighted_loss": float(total_loss.detach().item()),
+            "model_loss": float(model_loss.detach().item()),
+            "shuffle_loss": float(shuffle_loss.detach().item()),
+        })
+
         if verbose and (it % 50 == 0 or it == 1):
             print(
                 f"[Adam {it:04d}] "
@@ -735,6 +702,7 @@ def solve_signature_kernel_branched(
         X_bar_final.detach(),
         path_ext,
         snapshots,
+        training_history
     )
 
 def solve_signature_kernel_non_branched(
@@ -804,6 +772,65 @@ def solve_signature_kernel_non_branched(
 
 import torch
 import matplotlib.pyplot as plt
+
+def plot_training_history(training_history, use_log_scale=True):
+    """
+    Plot:
+      - learning rate in its own figure
+      - total loss, model loss, and shuffle loss in a 1x3 grid
+
+    training_history: list of dicts with keys
+        'iter', 'lr', 'total_weighted_loss', 'model_loss', 'shuffle_loss'
+    """
+    if len(training_history) == 0:
+        print("training_history is empty.")
+        return
+
+    iters = [row["iter"] for row in training_history]
+    lrs = [row["lr"] for row in training_history]
+    total_losses = [row["total_weighted_loss"] for row in training_history]
+    model_losses = [row["model_loss"] for row in training_history]
+    shuffle_losses = [row["shuffle_loss"] for row in training_history]
+
+    plt.figure(figsize=(7, 4))
+    plt.plot(iters, lrs, color="purple", linewidth=2)
+    plt.title("Learning Rate")
+    plt.xlabel("Iteration")
+    plt.ylabel("LR")
+    plt.grid(True, alpha=0.3)
+    if use_log_scale:
+        plt.yscale("log")
+    plt.tight_layout()
+    plt.show()
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 4), sharex=True)
+
+    axes[0].plot(iters, total_losses, color="black", linewidth=2)
+    axes[0].set_title("Total Weighted Loss")
+    axes[0].set_xlabel("Iteration")
+    axes[0].set_ylabel("Loss")
+    axes[0].grid(True, alpha=0.3)
+    if use_log_scale:
+        axes[0].set_yscale("log")
+
+    axes[1].plot(iters, model_losses, color="blue", linewidth=2)
+    axes[1].set_title("Model Loss")
+    axes[1].set_xlabel("Iteration")
+    axes[1].set_ylabel("Loss")
+    axes[1].grid(True, alpha=0.3)
+    if use_log_scale:
+        axes[1].set_yscale("log")
+
+    axes[2].plot(iters, shuffle_losses, color="red", linewidth=2)
+    axes[2].set_title("Shuffle Loss")
+    axes[2].set_xlabel("Iteration")
+    axes[2].set_ylabel("Loss")
+    axes[2].grid(True, alpha=0.3)
+    if use_log_scale:
+        axes[2].set_yscale("log")
+
+    fig.tight_layout()
+    plt.show()
 
 
 def plot_kuramoto_thetas_and_signals(
