@@ -705,7 +705,6 @@ def solve_signature_kernel_non_branched(
     K_coupling: float,
     kernel_type: str = "rbf",
     normalize: bool = True,
-    beta_reg: float = 1e-10,
     max_beta_iter: int = 500,
     beta_method: str = "l-bfgs",
 ):
