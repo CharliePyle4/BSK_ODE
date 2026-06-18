@@ -12,7 +12,6 @@ print("Using device:", active_device, "torch", torch.__version__)
 import time
 import math
 import numpy as np
-import torchmin
 from torch import nn
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
@@ -196,7 +195,7 @@ def forcing_loss(
     return torch.mean(residual**2)
 
 
-'''def cumtrapz_torch(y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+def cumtrapz_torch(y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     """
     y: (T, M), x: (T,)
     returns integral along dim=0 with zero at x[0], shape (T, M)
@@ -205,8 +204,9 @@ def forcing_loss(
     area = 0.5 * (y[1:] + y[:-1]) * dx[:, None]
     out = torch.zeros_like(y)
     out[1:] = torch.cumsum(area, dim=0)
-    return out'''
+    return out
 
+'''
 # NOTE !!! THIS IS LEFT RIEMANN NOT TRAPEZOIDAL
 def cumtrapz_torch(y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     """
@@ -218,6 +218,7 @@ def cumtrapz_torch(y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     out = torch.zeros_like(y)
     out[1:] = torch.cumsum(y[:-1], dim=0) * dt
     return out
+'''
 
 def normalize_kernel_matrix(
     Z: torch.Tensor,
@@ -287,7 +288,7 @@ def build_kernel_from_signatures(
     return Ker
 
 
-def build_kernel_operators(
+'''def build_kernel_operators(
     Ksig: torch.Tensor,
     x: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -298,7 +299,21 @@ def build_kernel_operators(
     """
     Kp = Ksig.clone()
     K = cumtrapz_torch(Kp, x)
-    return Kp, K
+    return Kp, K'''
+
+def build_kuramoto_operator_stack(
+    Ksig: torch.Tensor,
+    x: torch.Tensor
+) -> torch.Tensor:
+    """
+    Returns K_stack with shape (2, T, T), where
+
+      K_stack[0] = Kp  so that dtheta_dt = Kp @ beta
+      K_stack[1] = K   so that theta     = theta0 + K @ beta
+    """
+    Kp = Ksig.clone()
+    K = cumtrapz_torch(Kp, x)
+    return torch.stack([Kp, K], dim=0)   # (2, T, T)
 
 
 def kuramoto_coupling(theta: torch.Tensor, K_coupling: float) -> torch.Tensor:
@@ -313,7 +328,7 @@ def kuramoto_coupling(theta: torch.Tensor, K_coupling: float) -> torch.Tensor:
     coupling = (K_coupling / N) * torch.sin(diff).sum(dim=2)
     return coupling
 
-def solve_betas_kuramoto(
+'''def solve_betas_kuramoto(
     Ksig: torch.Tensor,
     forcing_true: torch.Tensor,          # (T, N), e.g. sigma_i * eta_i^H(t_k)
     x: torch.Tensor,                     # (T,)
@@ -408,6 +423,82 @@ def solve_betas_kuramoto(
         theta, dtheta_dt, lhs, forcing_pred = forward(beta_opt)
 
     return beta_opt, theta, dtheta_dt, lhs, forcing_pred
+'''
+
+
+
+
+
+
+
+def solve_betas_kuramoto(
+    K_stack: torch.Tensor,              # (2, T, T)
+    forcing_true: torch.Tensor,         # (T, N)
+    x: torch.Tensor,                    # (T,)
+    theta0: torch.Tensor,               # (N,)
+    omega: float | torch.Tensor,        # scalar or (N,)
+    K_coupling: float,
+    beta_init: torch.Tensor | None = None,   # (T, N)
+    max_iter: int = 500,
+    method: str = "l-bfgs",
+):
+    if method.lower() != "l-bfgs":
+        raise ValueError(f"Only 'l-bfgs' is supported, got {method!r}")
+
+    dtype = K_stack.dtype
+    device = K_stack.device
+
+    forcing_true = forcing_true.to(device=device, dtype=dtype)
+    x = x.to(device=device, dtype=dtype)
+
+    T = K_stack.shape[-1]
+    N = forcing_true.shape[1]
+
+    theta0 = theta0.to(device=device, dtype=dtype).reshape(N)
+
+    if isinstance(omega, (int, float)):
+        omega_vec = torch.full((N,), float(omega), dtype=dtype, device=device)
+    else:
+        omega_vec = omega.to(device=device, dtype=dtype).reshape(N)
+
+    beta = (
+        torch.zeros((T, N), dtype=dtype, device=device)
+        if beta_init is None
+        else beta_init.to(device=device, dtype=dtype).reshape(T, N).clone()
+    )
+    beta.requires_grad_(True)
+
+    optimizer = torch.optim.LBFGS(
+        [beta],
+        max_iter=max_iter,
+        tolerance_grad=1e-9,
+        tolerance_change=1e-12,
+        history_size=20,
+        line_search_fn="strong_wolfe",
+    )
+
+    def closure():
+        optimizer.zero_grad()
+        z = torch.einsum('aij,jn->ain', K_stack, beta)   # (2, T, N)
+        dtheta_dt = z[0]
+        theta = theta0.unsqueeze(0) + z[1]
+        coupling = kuramoto_coupling(theta, K_coupling)
+        forcing_pred = dtheta_dt - omega_vec.unsqueeze(0) - coupling
+        loss = 0.5 * ((forcing_pred - forcing_true) ** 2).sum()
+        loss.backward()
+        return loss
+
+    optimizer.step(closure)
+
+    with torch.no_grad():
+        z = torch.einsum('aij,jn->ain', K_stack, beta.detach())   # (2, T, N)
+        dtheta_dt = z[0]
+        theta = theta0.unsqueeze(0) + z[1]
+        coupling = kuramoto_coupling(theta, K_coupling)
+        lhs = dtheta_dt - omega_vec.unsqueeze(0) - coupling
+        forcing_pred = lhs
+
+    return beta.detach(), theta, dtheta_dt, lhs, forcing_pred
 
 def init_path_extension_weights(m):
     if isinstance(m, nn.Linear):
@@ -549,6 +640,9 @@ def solve_signature_kernel_branched(
             kernel_type=kernel_type,
         )
 
+        K_stack = build_kuramoto_operator_stack(Ksig, t_grid)   # (2, T, T)
+
+
 
         # Decide whether to re-solve beta this iteration
         if (it == 1) or (it % beta_solve_every == 0):
@@ -559,10 +653,9 @@ def solve_signature_kernel_branched(
                 + (max_beta_iter - beta_min_iterations) * progress
             )
 
-            # Beta solve on detached K_stack — avoids double-backward
-            Ksig_detached = Ksig.detach()
-            beta_w, _, _, _, _= solve_betas_kuramoto(
-                Ksig=Ksig_detached,
+            K_stack_detached = K_stack.detach()
+            beta_w, _, _, _, _ = solve_betas_kuramoto(
+                K_stack=K_stack_detached,
                 forcing_true=forcing_true.T,
                 x=t_grid,
                 theta0=theta0,
@@ -571,19 +664,18 @@ def solve_signature_kernel_branched(
                 beta_init=beta_prev,
                 max_iter=lbfgs_iters,
                 method=beta_method,
-            )
-            beta_prev = beta_w.detach().clone()
-
+            )         
+            beta_prev = beta_w.detach().clone()     
         else:
             # Reuse previous beta; no LBFGS this step
             beta_w = beta_prev 
 
 
-        Kp, K = build_kernel_operators(Ksig, t_grid)  # Kp,K: (T,T)
-        dtheta_dt = Kp @ beta_w                       # (T, N)
-        theta     = theta0.unsqueeze(0) + K @ beta_w   # (T, N)
-        coupling  = kuramoto_coupling(theta, K_coupling)
-        lhs       = dtheta_dt - omega_vec.unsqueeze(0) - coupling
+        z = torch.einsum('aij,jn->ain', K_stack, beta_w)   # (2, T, N)
+        dtheta_dt = z[0]
+        theta = theta0.unsqueeze(0) + z[1]
+        coupling = kuramoto_coupling(theta, K_coupling)
+        lhs = dtheta_dt - omega_vec.unsqueeze(0) - coupling
         forcing_pred = lhs
         
 
@@ -650,8 +742,10 @@ def solve_signature_kernel_branched(
             kernel_type=kernel_type,
         )
 
+        K_stack_final = build_kuramoto_operator_stack(Ksig_final, t_grid)
+
     beta, theta_fit_T, dtheta_fit_T, lhs_fit_T, forcing_fit_T = solve_betas_kuramoto(
-        Ksig=Ksig_final,
+        K_stack=K_stack_final,
         forcing_true=forcing_true.T,
         x=t_grid,
         theta0=theta0,
@@ -732,9 +826,11 @@ def solve_signature_kernel_non_branched(
         kernel_type=kernel_type
     )
 
+    K_stack = build_kuramoto_operator_stack(Ksig, t_grid)   # (2, T, T)
+
     beta, theta_fit_T, dtheta_fit_T, lhs_fit_T, forcing_fit_T = solve_betas_kuramoto(
-        Ksig=Ksig,
-        forcing_true=forcing_true.T,   # (T, N)
+        K_stack=K_stack,
+        forcing_true=forcing_true.T,     # (T, N)
         x=t_grid,
         theta0=theta0,
         omega=omega,
@@ -742,6 +838,7 @@ def solve_signature_kernel_non_branched(
         max_iter=max_beta_iter,
         method=beta_method,
     )
+
 
     theta_fit = theta_fit_T.T
     dtheta_fit = dtheta_fit_T.T
