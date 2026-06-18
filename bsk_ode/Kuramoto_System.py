@@ -527,22 +527,15 @@ class PathExtension(nn.Module):
         return self.net(x)
 
 
-'''def shuffle_loss_function(X_bar: torch.Tensor) -> torch.Tensor:
-    dX = X_bar[1:, :] - X_bar[:-1, :]
-    X_left = X_bar[:-1, :]
-    I = torch.einsum('ka,kb->ab', X_left, dX)
-    deltas = X_bar[-1, :] - X_bar[0, :]
-    R = deltas[:, None] * deltas[None, :] - (I + I.T)
-    return torch.triu(R.pow(2), diagonal=0).sum()
-'''
-
 def shuffle_loss_function(X_bar: torch.Tensor) -> torch.Tensor:
     dX = X_bar[1:, :] - X_bar[:-1, :]
     X_left = X_bar[:-1, :]
     I = torch.einsum('ka,kb->ab', X_left, dX)
     deltas = X_bar[-1, :] - X_bar[0, :]
     R = deltas[:, None] * deltas[None, :] - (I + I.T)
-    return torch.triu(R.pow(2), diagonal=0).mean()  # ← .mean() not .sum()
+    return torch.triu(R.pow(2), diagonal=0).sum()
+
+
 
 def solve_signature_kernel_branched(
     t_grid: torch.Tensor,
