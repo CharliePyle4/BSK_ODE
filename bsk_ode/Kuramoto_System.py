@@ -195,6 +195,7 @@ def forcing_loss(
     return torch.mean(residual**2)
 
 
+'''
 def cumtrapz_torch(y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     """
     y: (T, M), x: (T,)
@@ -205,8 +206,8 @@ def cumtrapz_torch(y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     out = torch.zeros_like(y)
     out[1:] = torch.cumsum(area, dim=0)
     return out
-
 '''
+
 # NOTE !!! THIS IS LEFT RIEMANN NOT TRAPEZOIDAL
 def cumtrapz_torch(y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     """
@@ -218,7 +219,6 @@ def cumtrapz_torch(y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     out = torch.zeros_like(y)
     out[1:] = torch.cumsum(y[:-1], dim=0) * dt
     return out
-'''
 
 def normalize_kernel_matrix(
     Z: torch.Tensor,
