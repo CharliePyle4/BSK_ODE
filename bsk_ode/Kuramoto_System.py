@@ -558,7 +558,6 @@ def solve_signature_kernel_branched(
     adam_sched_factor: float = 0.5,
     adam_sched_patience: int = 1000,
     num_snapshots: int = 10,
-    grad_clip: float | None = 1.0,
     verbose: bool = True,
     beta_solve_every: int = 1,
     beta_min_iterations: int = 20,
@@ -692,8 +691,6 @@ def solve_signature_kernel_branched(
         total_loss.backward()
 
 
-        if grad_clip is not None:
-            torch.nn.utils.clip_grad_norm_(path_ext.parameters(), max_norm=grad_clip)
 
         optimizer.step()
 
