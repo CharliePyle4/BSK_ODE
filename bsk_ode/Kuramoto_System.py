@@ -16,18 +16,16 @@ import torchmin
 from torch import nn
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
-from torchmin import least_squares
-from torchmin import minimize
 from torch import cumulative_trapezoid  # or torch.cumulative_trapezoid in newer versions
 
 
 import keras_sig
-from keras_sig import SigLayer
 
 import math
 from typing import Tuple
 import torch
 
+from .stochastic.processes.continuous import FractionalBrownianMotion
 
 # Cell 3 - seed
 SEED = 42
@@ -41,13 +39,14 @@ torch.backends.cudnn.benchmark = False
 
 
 
+
 def generate_noise(
     N_paths: int,
     N_points: int,
     t0: float = 0.0,
     T: float = 1.0,
     hurst: float = 0.2,
-    method: str = "daviesharte",
+    method: str = "daviesharte",  # kept for API compatibility, not used here
 ) -> torch.Tensor:
     """
     Generates N_paths paths of N_points observations of fractional Gaussian noise.
@@ -57,17 +56,29 @@ def generate_noise(
     eta : (N_paths, N_points)
         Noise rate dB/dt at each point.
     """
-    # generate N_points+1 values of fBm for each path
     length = T - t0
-    B = torch.empty(N_paths, N_points + 1, device=active_device)
-    for i in range(N_paths):
-        fbm_gen = FBM(n=N_points, hurst=hurst, length=length, method=method)
-        B[i] = torch.tensor(fbm_gen.fbm(), device=active_device)
+    dt = length / N_points
 
-    # calculate the FGN
-    dt  = length / N_points
-    dB  = B[:, 1:] - B[:, :-1]
-    eta = dB / dt
+    # One RNG for reproducible but independent paths
+    rng = np.random.default_rng(SEED)
+
+    eta = torch.empty(N_paths, N_points,
+                      device=active_device,
+                      dtype=torch.get_default_dtype())
+
+    for i in range(N_paths):
+        fbm_gen = FractionalBrownianMotion(
+            hurst=hurst,
+            t=length,
+            rng=rng,
+        )
+        # N_points+1 samples over [t0, T]
+        fbm_sample = fbm_gen.sample(n=N_points + 1)
+        B = torch.tensor(fbm_sample,
+                         device=active_device,
+                         dtype=torch.get_default_dtype())
+        dB = B[1:] - B[:-1]      # (N_points,)
+        eta[i] = dB / dt         # fractional Gaussian noise rate
 
     return eta
 
@@ -302,7 +313,6 @@ def kuramoto_coupling(theta: torch.Tensor, K_coupling: float) -> torch.Tensor:
     coupling = (K_coupling / N) * torch.sin(diff).sum(dim=2)
     return coupling
 
-
 def solve_betas_kuramoto(
     Ksig: torch.Tensor,
     forcing_true: torch.Tensor,          # (T, N), e.g. sigma_i * eta_i^H(t_k)
@@ -313,7 +323,7 @@ def solve_betas_kuramoto(
     beta_init: torch.Tensor | None = None,   # (T, N)
     reg: float = 1e-10,
     max_iter: int = 500,
-    method: str = "l-bfgs",
+    method: str = "l-bfgs",              # kept for API compatibility
 ):
     """
     Returns:
@@ -329,6 +339,9 @@ def solve_betas_kuramoto(
       lhs          = dtheta_dt - omega - coupling(theta)
       forcing_pred = lhs
     """
+    if method.lower() != "l-bfgs":
+        raise ValueError(f"Only 'l-bfgs' is supported, got {method!r}")
+
     dtype = Ksig.dtype
     device = Ksig.device
 
@@ -346,44 +359,58 @@ def solve_betas_kuramoto(
     else:
         omega_vec = omega.to(device=device, dtype=dtype).reshape(N)
 
-    Kp, K = build_kernel_operators(Ksig, x)
+    Kp, K = build_kernel_operators(Ksig, x)  # Kp,K: (T,T)
 
+    # ----- initialization / warm start -----
     if beta_init is None:
         beta0 = torch.zeros((T, N), dtype=dtype, device=device)
     else:
         beta0 = beta_init.clone().detach().to(device=device, dtype=dtype).reshape(T, N)
 
-    def forward(beta: torch.Tensor):
-        dtheta_dt = Kp @ beta
-        theta = theta0.unsqueeze(0) + K @ beta
-        coupling = kuramoto_coupling(theta, K_coupling)
-        lhs = dtheta_dt - omega_vec.unsqueeze(0) - coupling
+    # LBFGS works on a 1D parameter vector; we reshape inside the closure
+    beta_vec = beta0.reshape(-1).clone().detach().requires_grad_(True)
+
+    def forward(beta_mat: torch.Tensor):
+        # beta_mat: (T, N)
+        dtheta_dt = Kp @ beta_mat                       # (T, N)
+        theta     = theta0.unsqueeze(0) + K @ beta_mat  # (T, N)
+        coupling  = kuramoto_coupling(theta, K_coupling)
+        lhs       = dtheta_dt - omega_vec.unsqueeze(0) - coupling
         forcing_pred = lhs
         return theta, dtheta_dt, lhs, forcing_pred
 
-    def residual(beta: torch.Tensor) -> torch.Tensor:
-        _, _, _, forcing_pred = forward(beta)
-        return (forcing_pred - forcing_true).reshape(-1)
+    def closure():
+        # Called by LBFGS; recomputes loss and gradients
+        optimizer.zero_grad()
+        beta_mat = beta_vec.view(T, N)
+        _, _, _, forcing_pred = forward(beta_mat)
+        r = forcing_pred - forcing_true
+        data_term = 0.5 * (r**2).mean()
+        reg_term  = 0.5 * reg * (beta_mat**2).mean()
+        loss = data_term + reg_term
+        loss.backward()
+        return loss
 
-    def objective(beta: torch.Tensor) -> torch.Tensor:
-        r = residual(beta)
-        data_term = 0.5 * torch.mean(r**2)
-        reg_term = 0.5 * reg * torch.mean(beta**2)
-        return data_term + reg_term
+    if max_iter > 0:
+        optimizer = torch.optim.LBFGS(
+            [beta_vec],
+            max_iter=max_iter,
+            tolerance_grad=1e-9,
+            tolerance_change=1e-12,
+            history_size=20,
+            line_search_fn="strong_wolfe",
+        )
+        optimizer.step(closure)
+    # else: no optimization; just use beta0 as-is
 
-    res = minimize(
-        objective,
-        beta0,
-        method=method,
-        max_iter=max_iter,
-        tol=1e-12,
-    )
+    # Get final beta matrix
+    beta_opt = beta_vec.detach().view(T, N) if max_iter > 0 else beta0
 
-    beta_opt = res.x
-    theta, dtheta_dt, lhs, forcing_pred = forward(beta_opt)
+    # Final forward pass (no grad)
+    with torch.no_grad():
+        theta, dtheta_dt, lhs, forcing_pred = forward(beta_opt)
 
     return beta_opt, theta, dtheta_dt, lhs, forcing_pred
-
 
 class PathExtension(nn.Module):
     def __init__(self,
@@ -414,11 +441,6 @@ def shuffle_loss_function(X_bar: torch.Tensor) -> torch.Tensor:
     R = deltas[:, None] * deltas[None, :] - (I + I.T)
     return torch.triu(R.pow(2), diagonal=0).sum()
 
-import torch
-import numpy as np
-from torch import nn
-
-
 def solve_signature_kernel_branched(
     t_grid: torch.Tensor,
     forcing_true: torch.Tensor,          # (N, T)
@@ -445,6 +467,9 @@ def solve_signature_kernel_branched(
     num_snapshots: int = 10,
     grad_clip: float | None = 1.0,
     verbose: bool = True,
+    beta_solve_every: int = 1,
+    beta_min_iterations: int = 20,
+    beta_ramp_portion: float = 0.3,
 ):
     N, T = forcing_true.shape
     assert theta0.shape[0] == N, "theta0 must have shape (N,)"
@@ -463,8 +488,10 @@ def solve_signature_kernel_branched(
     else:
         omega_vec = omega.to(device=device, dtype=dtype).reshape(N)
 
+    # Base path: time + forcing
     X = torch.cat([t_grid.unsqueeze(1), forcing_true.T], dim=1)   # (T, 1+N)
 
+    # ---------------------- no-extension shortcut ---------------------- #
     if extensions == 0:
         X_sig = compute_signatures(X, depth)
         if normalize:
@@ -483,14 +510,15 @@ def solve_signature_kernel_branched(
             theta0=theta0,
             omega=omega_vec,
             K_coupling=K_coupling,
+            beta_init=None,
             reg=beta_reg,
             max_iter=max_beta_iter,
             method=beta_method,
         )
 
-        theta_fit = theta_fit_T.T
-        dtheta_fit = dtheta_fit_T.T
-        lhs_fit = lhs_fit_T.T
+        theta_fit   = theta_fit_T.T
+        dtheta_fit  = dtheta_fit_T.T
+        lhs_fit     = lhs_fit_T.T
         forcing_fit = forcing_fit_T.T
 
         final_loss = forcing_loss(forcing_true, forcing_fit)
@@ -515,12 +543,15 @@ def solve_signature_kernel_branched(
             snapshots,
         )
 
+    # ------------------------ branched (NN) case ------------------------ #
     path_ext = PathExtension(
         input_dim=X.shape[1],
         output_dim=extensions,
         hidden_dims=hidden_dims,
         activation_cls=activation_cls,
     ).to(device=device, dtype=dtype)
+
+    path_ext = torch.compile(path_ext)
 
     optimizer = torch.optim.Adam(
         list(path_ext.parameters()),
@@ -551,7 +582,7 @@ def solve_signature_kernel_branched(
     for it in range(1, adam_iters + 1):
         optimizer.zero_grad()
 
-        out_ext = path_ext(X)                          # (T, extensions)
+        out_ext = path_ext(X)                         # (T, extensions)
         X_bar = torch.cat([X, out_ext], dim=1)        # (T, 1+N+extensions)
 
         X_sig = compute_signatures(X_bar, depth)
@@ -564,23 +595,45 @@ def solve_signature_kernel_branched(
             kernel_type=kernel_type,
         )
 
-        beta_w, theta_fit_T, dtheta_fit_T, lhs_fit_T, forcing_fit_T = solve_betas_kuramoto(
-            Ksig=Ksig,
-            forcing_true=forcing_true.T,
-            x=t_grid,
-            theta0=theta0,
-            omega=omega_vec,
-            K_coupling=K_coupling,
-            beta_init=beta_prev,
-            reg=beta_reg,
-            max_iter=max_beta_iter,
-            method=beta_method,
-        )
-        beta_prev = beta_w.detach()
+        # -------- beta schedule (LBFGS work) --------
+        if (it == 1) or (it % beta_solve_every == 0):
+            progress = min(1.0, it / (adam_iters * beta_ramp_portion))
+            beta_iters = int(
+                beta_min_iterations
+                + (max_beta_iter - beta_min_iterations) * progress
+            )
 
-        theta_fit = theta_fit_T.T
-        dtheta_fit = dtheta_fit_T.T
-        lhs_fit = lhs_fit_T.T
+            beta_w, theta_fit_T, dtheta_fit_T, lhs_fit_T, forcing_fit_T = solve_betas_kuramoto(
+                Ksig=Ksig,
+                forcing_true=forcing_true.T,
+                x=t_grid,
+                theta0=theta0,
+                omega=omega_vec,
+                K_coupling=K_coupling,
+                beta_init=beta_prev,
+                reg=beta_reg,
+                max_iter=beta_iters,
+                method=beta_method,
+            )
+            beta_prev = beta_w.detach()
+        else:
+            # Reuse previous beta; do a forward-only pass
+            _, theta_fit_T, dtheta_fit_T, lhs_fit_T, forcing_fit_T = solve_betas_kuramoto(
+                Ksig=Ksig,
+                forcing_true=forcing_true.T,
+                x=t_grid,
+                theta0=theta0,
+                omega=omega_vec,
+                K_coupling=K_coupling,
+                beta_init=beta_prev,
+                reg=beta_reg,
+                max_iter=0,      # no optimization, just forward
+                method=beta_method,
+            )
+
+        theta_fit   = theta_fit_T.T
+        dtheta_fit  = dtheta_fit_T.T
+        lhs_fit     = lhs_fit_T.T
         forcing_fit = forcing_fit_T.T
 
         model_loss   = forcing_loss(forcing_true, forcing_fit)
@@ -614,6 +667,7 @@ def solve_signature_kernel_branched(
                 "forcing_fit": forcing_fit.detach().clone(),
             })
 
+    # ------------------------ final evaluation ------------------------ #
     with torch.no_grad():
         out_ext_final = path_ext(X)
         X_bar_final = torch.cat([X, out_ext_final], dim=1)
@@ -641,9 +695,9 @@ def solve_signature_kernel_branched(
         method=beta_method,
     )
 
-    theta_fit = theta_fit_T.T
-    dtheta_fit = dtheta_fit_T.T
-    lhs_fit = lhs_fit_T.T
+    theta_fit   = theta_fit_T.T
+    dtheta_fit  = dtheta_fit_T.T
+    lhs_fit     = lhs_fit_T.T
     forcing_fit = forcing_fit_T.T
 
     final_loss = forcing_loss(forcing_true, forcing_fit)
