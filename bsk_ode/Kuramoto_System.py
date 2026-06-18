@@ -705,6 +705,22 @@ def solve_signature_kernel_branched(
         training_history
     )
 
+
+    
+
+        # Recompute f_pred through live K_stack so pde_loss trains path_ext
+        z = K_stack @ beta_w           # uses non-detached K_stack
+        u_tmp = ua + upa * (x - x[0]) + z[2]
+        f_pred = z[0] + k1 * (upa + z[1]) + k2 * u_tmp + k3 * u_tmp**3
+
+        pde_loss = forcing_loss(f, f_pred)
+
+        # Total loss (PDE + shuffle)
+        loss = ADAM_lambda_model * pde_loss + ADAM_lambda_shuffle * shuffle_loss
+        loss.backward()
+        opt.step()
+    
+
 def solve_signature_kernel_non_branched(
     t_grid: torch.Tensor,
     forcing_true: torch.Tensor,          # (N, T), e.g. sigma_i * eta_i^H(t_k)
