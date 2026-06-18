@@ -20,9 +20,14 @@ from scipy.integrate import solve_ivp
 from torchmin import least_squares
 from torchmin import minimize
 from torch import cumulative_trapezoid
+import torch.nn.functional as F
+
 
 import keras_sig
 from keras_sig import SigLayer
+
+from .stochastic.processes.continuous import FractionalBrownianMotion
+
 
 
 # Cell 3 - seed
@@ -35,16 +40,17 @@ torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
 
-
 def f_forcing_fbm(x: torch.Tensor, hurst: float = 0.2) -> torch.Tensor:
-    """Fractional Brownian motion on [a,b] using fbm (Davies–Harte)."""
+    """Fractional Brownian motion on [a,b] using the stochastic library."""
     N = x.numel()
     a_ = float(x[0])
     b_ = float(x[-1])
     length = b_ - a_
 
-    f = FBM(n=N-1, hurst=hurst, length=length, method='daviesharte')
-    fbm_sample = f.fbm()
+    rng = np.random.default_rng(SEED)
+    fbm_gen = FractionalBrownianMotion(hurst=hurst, t=length, rng=rng)
+    fbm_sample = fbm_gen.sample(n=N - 1)
+
     return torch.tensor(fbm_sample, dtype=x.dtype, device=x.device)
 
 def solve_linear_ivp(x_grid: torch.Tensor,
@@ -125,29 +131,28 @@ def l2_err(y: torch.Tensor, yref: torch.Tensor, x: torch.Tensor) -> torch.Tensor
     return torch.sqrt(torch.trapz((y - yref)**2, x))
 
 
-def compute_signatures(path: torch.Tensor,
-                       depth: int) -> torch.Tensor:
-    """
-    path: (T, d) or (1, T, d) torch tensor.
-    Returns: (T, D) prefix-signature features as torch.Tensor.
-    """
+
+
+def compute_signatures(path: torch.Tensor, depth: int) -> torch.Tensor:
+    # path: (T, d) on CUDA
     if path.dim() == 2:
-        path = path.unsqueeze(0)          # (1, T, d)
+        path = path.unsqueeze(0)  # (1, T, d)
 
-    # Prepend basepoint, emulating Signatory's basepoint behaviour
-    basepoint = path[:, 0:1, :]           # (1, 1, d)
-    path_bp = torch.cat([basepoint, path], dim=1)  # (1, T+1, d)
+    # keep on GPU
+    pathbp = torch.cat([path[:, :1, :], path], dim=1)  # basepoint on GPU
 
-    # Streaming signatures on the basepoint-augmented path:
-    # for length = T+1, stream=True → output length-1 = T
-    sigs = keras_sig.signature(
-        path_bp,
+    sigsraw = keras_sig.signature(
+        pathbp,
         depth=depth,
         stream=True,
-        gpu_optimized=True
-    )                                      # (1, T, D)
+        gpu_optimized=True,  
+    ).to(path.dtype)
+    # convert back to torch if needed; but with Keras 3 + torch backend, this should already be a torch tensor
+    if not isinstance(sigsraw, torch.Tensor):
+        sigsraw = torch.tensor(sigsraw, dtype=path.dtype, device=path.device)
 
-    return sigs.squeeze(0)                # (T, D)
+    return sigsraw.squeeze(0).to(path.device)
+
 
 
 def build_kernel_from_signatures(sigs_flat: torch.Tensor,
@@ -308,25 +313,15 @@ def apply_signature_normalization(sigs_flat: torch.Tensor,
     else:
         raise ValueError(f"Unknown normalization scheme '{scheme}'")
 
-def build_kernel_operators(Ksig: torch.Tensor,
-                           x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Vectorized construction of Ku2, Kup, Ku from Ksig.
-    """
-    # Ksig: (N, N), integrate along rows (dim=0) w.r.t. x (N,)
-    Ku2 = Ksig.clone()  # u''
 
-    # first integral: shape (N-1, N), then pad a leading zero row
-    I1 = cumulative_trapezoid(Ku2, x, dim=0)          # (N-1, N)
-    I1 = torch.vstack([torch.zeros_like(I1[0:1, :]), I1])  # (N, N)
-    Kup = I1
 
-    # second integral: integrate I1 again along x
-    I2 = cumulative_trapezoid(I1, x, dim=0)           # (N-1, N)
-    I2 = torch.vstack([torch.zeros_like(I2[0:1, :]), I2])  # (N, N)
-    Ku = I2
 
-    return Ku2, Kup, Ku
+def build_kernel_operators(Ksig: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    I1  = torch.cumulative_trapezoid(Ksig, x, dim=0)
+    Kup = F.pad(I1, (0, 0, 1, 0))
+    I2  = torch.cumulative_trapezoid(Kup, x, dim=0)
+    Ku  = F.pad(I2, (0, 0, 1, 0))
+    return torch.stack([Ksig, Kup, Ku])   # (3, N, N)
 
 
 def solve_betas(Ksig: torch.Tensor,
@@ -337,46 +332,30 @@ def solve_betas(Ksig: torch.Tensor,
                 a_fun,
                 b_fun,
                 c_fun,
-                reg: float = 1e-20,    #dummy parameter, not used anymore but kept for compatability
                 **kwargs):
-    """
-    For a(x) u'' + b(x) u' + c(x) u = f(x), solve beta by linear regression.
-
-    Model:
-      u'' = Ku2 @ beta
-      u'  = upa + Kup @ beta
-      u   = ua + upa*(x - x0) + Ku @ beta
-    """
-
-    Ku2, Kup, Ku = build_kernel_operators(Ksig, x)
+    K_stack = build_kernel_operators(Ksig, x)   # (3, N, N)
     N  = Ksig.shape[0]
     x0 = x[0]
 
-    # coefficient vectors on grid
-    a_vec = a_fun(x)      # shape (N,)
+    a_vec = a_fun(x)
     b_vec = b_fun(x)
     c_vec = c_fun(x)
 
-    # A[i,:] = a(x_i)*Ku2[i,:] + b(x_i)*Kup[i,:] + c(x_i)*Ku[i,:]
-    A = a_vec[:, None] * Ku2 + b_vec[:, None] * Kup + c_vec[:, None] * Ku
+    # A[i,:] = a(x_i)*K[0,i,:] + b(x_i)*K[1,i,:] + c(x_i)*K[2,i,:]
+    A = (a_vec[:, None] * K_stack[0]
+       + b_vec[:, None] * K_stack[1]
+       + c_vec[:, None] * K_stack[2])
 
-    # rhs = f - b(x)*upa - c(x)*(ua + upa*(x - x0))
     rhs = f - b_vec * upa - c_vec * (ua + upa * (x - x0))
-
-    ATrhs = A.T @ rhs
-    #beta  = torch.linalg.solve(ATA, ATrhs)
-    #ATA   = A.T @ A + reg * torch.eye(N, dtype=A.dtype, device=A.device)
 
     beta = torch.linalg.solve(A.T @ A, A.T @ rhs)
 
-    # reconstruct u, u', u''
-    u_dd = Ku2 @ beta
-    u_p  = upa + Kup @ beta
-    u    = ua + upa * (x - x0) + Ku @ beta
+    z    = K_stack @ beta          # (3, N)
+    u_dd = z[0]
+    u_p  = upa + z[1]
+    u    = ua + upa * (x - x0) + z[2]
 
-    # predicted forcing
     f_pred = a_vec * u_dd + b_vec * u_p + c_vec * u
-
     return beta, u, f_pred
 
 
@@ -460,11 +439,6 @@ def solve_signature_kernel_non_branched(x, f,
             X_sig_norm, sigma=rbf_sigma, kernel_type=kernel_type
         )
    
-
-        Ksig = Ksig.to(torch.float64)
-        x    = x.to(torch.float64)
-        f    = f.to(torch.float64)
-
         beta_w, u, f_pred_final = solve_betas(
           Ksig=Ksig,
           f=f,
@@ -549,6 +523,7 @@ def solve_signature_kernel_branched(x, f,
         hidden_dims=hidden_dims,
         activation_cls=activation_cls
     ).to(device)
+    path_ext = torch.compile(path_ext)
 
 
     # Optimizer (Adam) over both extension net and beta_w
@@ -589,8 +564,7 @@ def solve_signature_kernel_branched(x, f,
         shuffle_loss = shuffle_loss_function(out_ext)
 
         # Build extended path
-        stack = torch.cat([X.unsqueeze(0), out_ext.unsqueeze(0)], dim=2)
-        X_ext = stack.squeeze(0)
+        X_ext = torch.cat([X, out_ext], dim=1)   # (T, 2+extensions)
 
         # signatures of extended path
         X_ext_sig = compute_signatures(X_ext, depth)
@@ -602,14 +576,12 @@ def solve_signature_kernel_branched(x, f,
         )
 
 
+
         # kernel from normalized extended signatures
         Ksig = build_kernel_from_signatures(
             X_ext_sig_norm, sigma=rbf_sigma, kernel_type=kernel_type
         )
 
-        Ksig = Ksig.to(torch.float64)
-        x    = x.to(torch.float64)
-        f    = f.to(torch.float64)
 
         beta_w, u_tmp, f_pred = solve_betas(
             Ksig=Ksig,
@@ -653,10 +625,9 @@ def solve_signature_kernel_branched(x, f,
         X_final = torch.stack([x, f], dim=1)
         out_ext_final = path_ext(X_final)
 
-        stack_final = torch.cat(
-            [X_final.unsqueeze(0), out_ext_final.unsqueeze(0)], dim=2
-        )
-        X_ext_final = stack_final.squeeze(0)
+
+        X_ext_final = torch.cat([X_final, out_ext_final], dim=1)
+
 
         X_ext_sig_final = compute_signatures(X_ext_final, depth)
         X_ext_sig_final_norm = apply_signature_normalization(
@@ -669,9 +640,6 @@ def solve_signature_kernel_branched(x, f,
         )
 
 
-        Ksig_final = Ksig_final.to(torch.float64)
-        X_final    = X_final.to(torch.float64)
-        f    = f.to(torch.float64)
 
         beta_w,u,f_pred_final = solve_betas(
             Ksig=Ksig_final,
