@@ -553,17 +553,18 @@ def solve_signature_kernel_branched(
             kernel_type=kernel_type,
         )
 
-        Ksig_detached = Ksig.detach()
 
-
-        # -------- beta schedule (LBFGS work) --------
+        # Decide whether to re-solve beta this iteration
         if (it == 1) or (it % beta_solve_every == 0):
+            # Ramp LBFGS iterations from beta_min_iterations -> beta_iterations
             progress = min(1.0, it / (adam_iters * beta_ramp_portion))
-            beta_iters = int(
+            lbfgs_iters = int(
                 beta_min_iterations
                 + (max_beta_iter - beta_min_iterations) * progress
             )
 
+            # Beta solve on detached K_stack — avoids double-backward
+            Ksig_detached = Ksig.detach()
             beta_w, theta_fit_T, dtheta_fit_T, lhs_fit_T, forcing_fit_T = solve_betas_kuramoto(
                 Ksig=Ksig_detached,
                 forcing_true=forcing_true.T,
@@ -573,24 +574,15 @@ def solve_signature_kernel_branched(
                 K_coupling=K_coupling,
                 beta_init=beta_prev,
                 reg=beta_reg,
-                max_iter=beta_iters,
+                max_iter=lbfgs_iters,
                 method=beta_method,
             )
-            beta_prev = beta_w.detach()
+            beta_prev = beta_w.detach().clone()
+
         else:
-            # Reuse previous beta; do a forward-only pass
-            _, theta_fit_T, dtheta_fit_T, lhs_fit_T, forcing_fit_T = solve_betas_kuramoto(
-                Ksig=Ksig_detached,
-                forcing_true=forcing_true.T,
-                x=t_grid,
-                theta0=theta0,
-                omega=omega_vec,
-                K_coupling=K_coupling,
-                beta_init=beta_prev,
-                reg=beta_reg,
-                max_iter=0,      # no optimization, just forward
-                method=beta_method,
-            )
+            # Reuse previous beta; no LBFGS this step
+            beta_w = beta_prev
+
 
         theta_fit   = theta_fit_T.T
         dtheta_fit  = dtheta_fit_T.T
@@ -599,20 +591,24 @@ def solve_signature_kernel_branched(
 
         # Adam gradient: recompute forcing_pred using the live Ksig (with graph)
         # so that gradients flow back through path_ext
-        beta_fixed = beta_w.detach() if (it == 1 or it % beta_solve_every == 0) else beta_prev
-
-        Kp_live = Ksig.clone()
+        # Live kernel (graph intact) with LBFGS beta_w
+        Kp_live = Ksig                      # live kernel
         K_live  = cumtrapz_torch(Kp_live, t_grid)
-        dtheta_live = Kp_live @ beta_fixed
-        theta_live  = theta0.unsqueeze(0) + K_live @ beta_fixed
-        coupling_live = kuramoto_coupling(theta_live, K_coupling)
-        forcing_pred_live = dtheta_live - omega_vec.unsqueeze(0) - coupling_live
+
+        # beta_w came from LBFGS; it has been detached there and reused via beta_prev
+        dtheta_live = Kp_live @ beta_w      # live Kp_live, fixed beta
+        theta_live  = theta0.unsqueeze(0) + K_live @ beta_w
+
+        # Coupling and forcing are also live
+        coupling_live      = kuramoto_coupling(theta_live, K_coupling)
+        forcing_pred_live  = dtheta_live - omega_vec.unsqueeze(0) - coupling_live
 
         model_loss   = forcing_loss(forcing_true, forcing_pred_live.T)
         shuffle_loss = shuffle_loss_function(out_ext)
         total_loss   = adam_lambda_model * model_loss + adam_lambda_shuffle * shuffle_loss
 
         total_loss.backward()
+
 
         if grad_clip is not None:
             torch.nn.utils.clip_grad_norm_(path_ext.parameters(), max_norm=grad_clip)
@@ -708,17 +704,6 @@ def solve_signature_kernel_branched(
 
     
 
-        # Recompute f_pred through live K_stack so pde_loss trains path_ext
-        z = K_stack @ beta_w           # uses non-detached K_stack
-        u_tmp = ua + upa * (x - x[0]) + z[2]
-        f_pred = z[0] + k1 * (upa + z[1]) + k2 * u_tmp + k3 * u_tmp**3
-
-        pde_loss = forcing_loss(f, f_pred)
-
-        # Total loss (PDE + shuffle)
-        loss = ADAM_lambda_model * pde_loss + ADAM_lambda_shuffle * shuffle_loss
-        loss.backward()
-        opt.step()
     
 
 def solve_signature_kernel_non_branched(
