@@ -23,6 +23,7 @@ from torchmin import least_squares
 from torchmin import minimize
 from torch import cumulative_trapezoid
 from .stochastic.processes.continuous import FractionalBrownianMotion
+from stochastic.processes.continuous import FractionalBrownianMotion
 
 import keras_sig
 from keras_sig import SigLayer
@@ -1614,36 +1615,26 @@ def plot_all_variants_test_only(
 
 def plot_learned_extensions(x, f_true, X_ext, title_prefix="Learned extensions"):
     """
-    X_ext is the full extended path (T, 2+E) or just extensions (T, E).
+    X_ext is (T, E): extensions only.
     Plots forcing on the first row, each extension on its own row below.
     """
-    t = x.detach().cpu().numpy()
-    f_np = f_true.detach().cpu().numpy()
-
-    if X_ext.shape[1] > 2:
-        ext_np = X_ext[:, 2:].detach().cpu().numpy()
-    else:
-        ext_np = X_ext.detach().cpu().numpy()
-
+    t   = x.detach().cpu().numpy()
+    fnp = f_true.detach().cpu().numpy()
+    ext_np = X_ext.detach().cpu().numpy()
     E = ext_np.shape[1]
+
     nrows = 1 + E
-
-    fig, axes = plt.subplots(
-        nrows, 1,
-        figsize=(10, 2.0 * nrows),
-        sharex=True
-    )
-
+    fig, axes = plt.subplots(nrows, 1, figsize=(10, 2.0 * nrows), sharex=True)
     if nrows == 1:
         axes = [axes]
 
     # Row 0: forcing
     ax0 = axes[0]
-    ax0.plot(t, f_np, 'k-')
+    ax0.plot(t, fnp, 'k-')
     ax0.set_ylabel("f(t)")
     ax0.set_title(f"{title_prefix}: forcing")
 
-    # Rows 1..E: each extension
+    # Rows 1..E: extensions
     for i in range(E):
         ax = axes[i + 1]
         ax.plot(t, ext_np[:, i], 'b-')
@@ -1652,7 +1643,6 @@ def plot_learned_extensions(x, f_true, X_ext, title_prefix="Learned extensions")
     axes[-1].set_xlabel("t")
     fig.tight_layout()
     plt.show()
-
 
 # ── 9. Calibration: 2×2 non-branched vs branched ─────────────────────────────
 def plot_calibration_2x2(
