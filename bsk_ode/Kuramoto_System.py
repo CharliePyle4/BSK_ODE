@@ -73,7 +73,7 @@ def generate_noise(
             rng=rng,
         )
         # N_points+1 samples over [t0, T]
-        fbm_sample = fbm_gen.sample(n=N_points + 1)
+        fbm_sample = fbm_gen.sample(n=N_points)
         B = torch.tensor(fbm_sample,
                          device=active_device,
                          dtype=torch.get_default_dtype())
