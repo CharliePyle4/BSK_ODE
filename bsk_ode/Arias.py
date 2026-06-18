@@ -457,6 +457,11 @@ def solve_signature_kernel_non_branched(x, f,
 
     return u, f_pred_final
 
+def init_path_extension_weights(m):
+    if isinstance(m, nn.Linear):
+        nn.init.xavier_uniform_(m.weight)
+        nn.init.zeros_(m.bias)
+
 class PathExtension(nn.Module):
     def __init__(self,
                  input_dim: int,
@@ -523,6 +528,9 @@ def solve_signature_kernel_branched(x, f,
         hidden_dims=hidden_dims,
         activation_cls=activation_cls
     ).to(device)
+
+    path_ext.apply(init_path_extension_weights)
+
     path_ext = torch.compile(path_ext)
 
 
