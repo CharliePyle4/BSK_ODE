@@ -321,7 +321,6 @@ def solve_betas_kuramoto(
     omega: float | torch.Tensor,         # scalar or (N,)
     K_coupling: float,
     beta_init: torch.Tensor | None = None,   # (T, N)
-    reg: float = 1e-10,
     max_iter: int = 500,
     method: str = "l-bfgs",              # kept for API compatibility
 ):
@@ -385,9 +384,7 @@ def solve_betas_kuramoto(
         beta_mat = beta_vec.view(T, N)
         _, _, _, forcing_pred = forward(beta_mat)
         r = forcing_pred - forcing_true
-        data_term = 0.5 * (r**2).mean()
-        reg_term  = 0.5 * reg * (beta_mat**2).mean()
-        loss = data_term + reg_term
+        loss = 0.5 * (r**2).sum() 
         loss.backward()
         return loss
 
@@ -457,7 +454,6 @@ def solve_signature_kernel_branched(
     K_coupling: float,
     kernel_type: str = "rbf",
     normalize: bool = True,
-    beta_reg: float = 1e-10,
     max_beta_iter: int = 500,
     beta_method: str = "l-bfgs",
     hidden_dims=(512, 256, 128, 64, 32, 16),
@@ -565,7 +561,7 @@ def solve_signature_kernel_branched(
 
             # Beta solve on detached K_stack — avoids double-backward
             Ksig_detached = Ksig.detach()
-            beta_w, theta_fit_T, dtheta_fit_T, lhs_fit_T, forcing_fit_T = solve_betas_kuramoto(
+            beta_w, _, _, _, _= solve_betas_kuramoto(
                 Ksig=Ksig_detached,
                 forcing_true=forcing_true.T,
                 x=t_grid,
@@ -573,7 +569,6 @@ def solve_signature_kernel_branched(
                 omega=omega_vec,
                 K_coupling=K_coupling,
                 beta_init=beta_prev,
-                reg=beta_reg,
                 max_iter=lbfgs_iters,
                 method=beta_method,
             )
@@ -581,29 +576,24 @@ def solve_signature_kernel_branched(
 
         else:
             # Reuse previous beta; no LBFGS this step
-            beta_w = beta_prev
+            beta_w = beta_prev 
 
 
-        theta_fit   = theta_fit_T.T
-        dtheta_fit  = dtheta_fit_T.T
-        lhs_fit     = lhs_fit_T.T
-        forcing_fit = forcing_fit_T.T
+        Kp, K = build_kernel_operators(Ksig, t_grid)  # Kp,K: (T,T)
+        dtheta_dt = Kp @ beta_w                       # (T, N)
+        theta     = theta0.unsqueeze(0) + K @ beta_w   # (T, N)
+        coupling  = kuramoto_coupling(theta, K_coupling)
+        lhs       = dtheta_dt - omega_vec.unsqueeze(0) - coupling
+        forcing_pred = lhs
+        
 
-        # Adam gradient: recompute forcing_pred using the live Ksig (with graph)
-        # so that gradients flow back through path_ext
-        # Live kernel (graph intact) with LBFGS beta_w
-        Kp_live = Ksig                      # live kernel
-        K_live  = cumtrapz_torch(Kp_live, t_grid)
+        # transpose so its fine
+        theta_fit = theta.T
+        dtheta_fit = dtheta_dt.T
+        lhs_fit = lhs.T
+        forcing_fit = forcing_pred.T
 
-        # beta_w came from LBFGS; it has been detached there and reused via beta_prev
-        dtheta_live = Kp_live @ beta_w      # live Kp_live, fixed beta
-        theta_live  = theta0.unsqueeze(0) + K_live @ beta_w
-
-        # Coupling and forcing are also live
-        coupling_live      = kuramoto_coupling(theta_live, K_coupling)
-        forcing_pred_live  = dtheta_live - omega_vec.unsqueeze(0) - coupling_live
-
-        model_loss   = forcing_loss(forcing_true, forcing_pred_live.T)
+        model_loss   = forcing_loss(forcing_true, forcing_fit)
         shuffle_loss = shuffle_loss_function(out_ext)
         total_loss   = adam_lambda_model * model_loss + adam_lambda_shuffle * shuffle_loss
 
@@ -668,7 +658,6 @@ def solve_signature_kernel_branched(
         omega=omega_vec,
         K_coupling=K_coupling,
         beta_init=beta_prev,
-        reg=beta_reg,
         max_iter=max_beta_iter,
         method=beta_method,
     )
@@ -751,7 +740,6 @@ def solve_signature_kernel_non_branched(
         theta0=theta0,
         omega=omega,
         K_coupling=K_coupling,
-        reg=beta_reg,
         max_iter=max_beta_iter,
         method=beta_method,
     )
