@@ -597,6 +597,10 @@ def evaluate_forcing_from_solution_method1(
     return f_pred
 
 
+def init_path_extension_weights(m):
+    if isinstance(m, nn.Linear):
+        nn.init.xavier_uniform_(m.weight)
+        nn.init.zeros_(m.bias)
 
 
 class PathExtension(nn.Module):
@@ -865,6 +869,8 @@ def solve_signature_kernel_branched_method1(x, f,
 '''
 
 
+
+
 # === Branched (extended‑path) signature‑kernel solver ===
 def solve_signature_kernel_branched_method1(x, f,
                                     k1, k2, k3,
@@ -897,10 +903,14 @@ def solve_signature_kernel_branched_method1(x, f,
         activation_cls=activation_cls
     ).to(device, dtype=torch.float64)
 
+    path_ext.apply(init_path_extension_weights)
+
+
     path_ext = torch.compile(path_ext)
 
     # Optimizer (Adam) over extension net parameters only
     snapshots = []
+    training_history = []
     opt = torch.optim.Adam(
         list(path_ext.parameters()),
         lr=adam_lr
@@ -1004,6 +1014,17 @@ def solve_signature_kernel_branched_method1(x, f,
             scheduler.step(loss.detach())
 
         # Logging and snapshots
+        current_lr = opt.param_groups[0]["lr"]
+
+        training_history.append({
+            "iter": it,
+            "lr": float(current_lr),
+            "total_weighted_loss": float(loss.detach().item()),
+            "model_loss": float(pde_loss.detach().item()),
+            "shuffle_loss": float(shuffle_loss.detach().item()),
+        })
+
+        # Logging and snapshots
         if it % 50 == 0:
             print(f"[Adam {it:04d}] loss={loss.item():.3e}, "
                   f"PDE={pde_loss.item():.3e}, "
@@ -1016,6 +1037,8 @@ def solve_signature_kernel_branched_method1(x, f,
                 "u": u_tmp.detach().clone(),
                 "f_pred": f_pred.detach().clone(),
             })
+ 
+            
     # ---------- Final evaluation ----------
     with torch.no_grad():
         X_final = torch.stack([x, f], dim=1)
@@ -1054,7 +1077,66 @@ def solve_signature_kernel_branched_method1(x, f,
         final_loss = forcing_loss(f, f_pred_final)
         print(f"Overall true final loss={final_loss:.3e}")
 
-    return u, snapshots, f_pred_final, path_ext
+    return u, snapshots, f_pred_final, path_ext, training_history
+
+def plot_training_history(training_history, use_log_scale=True):
+    """
+    Plot:
+      - learning rate in its own figure
+      - total loss, model loss, and shuffle loss in a 1x3 grid
+
+    training_history: list of dicts with keys
+        'iter', 'lr', 'total_weighted_loss', 'model_loss', 'shuffle_loss'
+    """
+    if len(training_history) == 0:
+        print("training_history is empty.")
+        return
+
+    iters = [row["iter"] for row in training_history]
+    lrs = [row["lr"] for row in training_history]
+    total_losses = [row["total_weighted_loss"] for row in training_history]
+    model_losses = [row["model_loss"] for row in training_history]
+    shuffle_losses = [row["shuffle_loss"] for row in training_history]
+
+    plt.figure(figsize=(7, 4))
+    plt.plot(iters, lrs, color="purple", linewidth=2)
+    plt.title("Learning Rate")
+    plt.xlabel("Iteration")
+    plt.ylabel("LR")
+    plt.grid(True, alpha=0.3)
+    if use_log_scale:
+        plt.yscale("log")
+    plt.tight_layout()
+    plt.show()
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 4), sharex=True)
+
+    axes[0].plot(iters, total_losses, color="black", linewidth=2)
+    axes[0].set_title("Total Weighted Loss")
+    axes[0].set_xlabel("Iteration")
+    axes[0].set_ylabel("Loss")
+    axes[0].grid(True, alpha=0.3)
+    if use_log_scale:
+        axes[0].set_yscale("log")
+
+    axes[1].plot(iters, model_losses, color="blue", linewidth=2)
+    axes[1].set_title("Model Loss")
+    axes[1].set_xlabel("Iteration")
+    axes[1].set_ylabel("Loss")
+    axes[1].grid(True, alpha=0.3)
+    if use_log_scale:
+        axes[1].set_yscale("log")
+
+    axes[2].plot(iters, shuffle_losses, color="red", linewidth=2)
+    axes[2].set_title("Shuffle Loss")
+    axes[2].set_xlabel("Iteration")
+    axes[2].set_ylabel("Loss")
+    axes[2].grid(True, alpha=0.3)
+    if use_log_scale:
+        axes[2].set_yscale("log")
+
+    fig.tight_layout()
+    plt.show()
 
 
 def test_nonbranched_method1(
