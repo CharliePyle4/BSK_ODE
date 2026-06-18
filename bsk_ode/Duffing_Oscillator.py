@@ -23,7 +23,6 @@ from torchmin import least_squares
 from torchmin import minimize
 from torch import cumulative_trapezoid
 from .stochastic.processes.continuous import FractionalBrownianMotion
-from stochastic.processes.continuous import FractionalBrownianMotion
 
 import keras_sig
 from keras_sig import SigLayer
