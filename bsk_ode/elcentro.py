@@ -401,7 +401,10 @@ def build_state(paths, n0: int, signature_level: int,
     K2_0 = trapezoidal_cols(K1_0, dt)
 
     Psi0  = m * K0 + c * K1_0 + k * K2_0
+
     rcond = torch.finfo(torch.float64).eps
+    Psi0.to(device)
+    F_star.to(device)
     alpha0 = torch.linalg.lstsq(
         Psi0, F_star[:n0 + 1], rcond=rcond, driver='gelsd'
     ).solution
