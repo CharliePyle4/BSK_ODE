@@ -270,11 +270,12 @@ def plot_calibration(time, F_star, F_hat, U_true, U_hat):
 
 
 def mse(pred, true):
+    pred = pred.to(true.device)
     return torch.mean((pred - true) ** 2).item()
 
 def rel_mse(pred, true):
+    pred = pred.to(true.device)
     return torch.mean((pred - true) ** 2).item() / torch.mean(true ** 2).item()
-
 
 def print_errors(F_pred, F_star, U_pred, U_true):
     # Ensure predictions on same device as references
