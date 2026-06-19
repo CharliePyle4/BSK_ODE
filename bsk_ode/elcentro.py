@@ -145,7 +145,7 @@ def apply_signature_normalization_pair(
     depth: int,
     dim: int,
     **kwargs
-) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Normalize both train and full signatures using training statistics only.
     Uses the same median/IQR scheme as normalize_signatures, but
@@ -488,9 +488,6 @@ def solve_signature_kernel_predict_retrain(
 
 
 
-
-
-
 # -------------------------------------------------------
 # Signature + normalization helpers (rolling version)
 # -------------------------------------------------------
@@ -796,7 +793,6 @@ def rolling_update_step(
 
     return u_new, f_new, beta_new
 
-
 def solve_signature_kernel_rolling_retrain(
     t_train: torch.Tensor,
     t_test: torch.Tensor,
@@ -813,17 +809,13 @@ def solve_signature_kernel_rolling_retrain(
 ):
     """
     Non-branched rolling testing with periodic retraining.
-
-    Uses:
-      - solve_signature_kernel_calibration for initial fit and full retrains
-      - rolling_update_step for one-step rolling coefficient updates between retrains
     """
 
     if use_tlift and holder_value is None:
         raise ValueError("holder_value must be provided when use_tlift=True")
 
     with torch.no_grad():
-        # Initial calibration on training set
+        # Initial fit
         u_pred_train, f_pred_train, beta = solve_signature_kernel_calibration(
             x=t_train,
             f=f_train,
@@ -839,27 +831,31 @@ def solve_signature_kernel_rolling_retrain(
         u_pred_full = u_pred_train.clone()
         f_pred_full = f_pred_train.clone()
 
-        # Build/store current training signatures
-        X_train = torch.stack([t_train, f_train], dim=1)
-        if use_tlift:
-            X_train = tlift(X_train, holder_value)
+        # Current fitted set
+        t_fit = t_train.clone()
+        f_fit = f_train.clone()
 
-        X_sig_train = compute_signatures(X_train, depth)
+        X_fit = torch.stack([t_fit, f_fit], dim=1)
+        if use_tlift:
+            X_fit = tlift(X_fit, holder_value)
+
+        X_sig_train = compute_signatures(X_fit, depth)
         if normalize:
             X_sig_train = normalize_signatures(
                 Z=X_sig_train,
                 depth=depth,
-                dim=X_train.shape[1],
+                dim=X_fit.shape[1],
             )
 
         N_test = t_test.numel()
 
         for j in range(1, N_test + 1):
+            # Full retrain step
             if (j % retrain_every) == 0:
                 t_fit = torch.cat([t_train, t_test[:j]], dim=0)
                 f_fit = torch.cat([f_train, f_test[:j]], dim=0)
 
-                _, _, beta = solve_signature_kernel_calibration(
+                u_fit, f_fit_pred, beta = solve_signature_kernel_calibration(
                     x=t_fit,
                     f=f_fit,
                     k1=k1, k2=k2, k3=k3,
@@ -883,27 +879,34 @@ def solve_signature_kernel_rolling_retrain(
                         dim=X_fit.shape[1],
                     )
 
-                t_curr = t_fit
-                f_curr = f_fit
-            else:
-                t_curr = torch.cat([t_train, t_test[:j]], dim=0)
-                f_curr = torch.cat([f_train, f_test[:j]], dim=0)
+                # calibration already includes the newest point
+                u_new = u_fit[-1]
+                f_new = f_fit_pred[-1]
 
-            u_new, f_new, beta = rolling_update_step(
-                beta_prev=beta,
-                X_sig_train=X_sig_train,
-                t_curr=t_curr,
-                f_curr=f_curr,
-                k1=k1,
-                k2=k2,
-                k3=k3,
-                ua=ua,
-                upa=upa,
-                depth=depth,
-                normalize=normalize,
-                use_tlift=use_tlift,
-                holder_value=holder_value,
-            )
+            else:
+                # one-step extension beyond current fitted set
+                t_curr = torch.cat([t_fit, t_test[j-1:j]], dim=0)
+                f_curr = torch.cat([f_fit, f_test[j-1:j]], dim=0)
+
+                u_new, f_new, beta = rolling_update_step(
+                    beta_prev=beta,
+                    X_sig_train=X_sig_train,
+                    t_curr=t_curr,
+                    f_curr=f_curr,
+                    k1=k1,
+                    k2=k2,
+                    k3=k3,
+                    ua=ua,
+                    upa=upa,
+                    depth=depth,
+                    normalize=normalize,
+                    use_tlift=use_tlift,
+                    holder_value=holder_value,
+                )
+
+                # rolling state advances by one point
+                t_fit = t_curr
+                f_fit = f_curr
 
             u_pred_full = torch.cat([u_pred_full, u_new.unsqueeze(0)], dim=0)
             f_pred_full = torch.cat([f_pred_full, f_new.unsqueeze(0)], dim=0)
@@ -914,6 +917,7 @@ def solve_signature_kernel_rolling_retrain(
     print(f"final forcing loss (train+test, rolling): {final_loss.item():.3e}")
 
     return u_pred_full, f_pred_full
+
 
 def mse(pred, true):
     pred = pred.to(true.device)
