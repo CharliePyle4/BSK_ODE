@@ -325,9 +325,6 @@ def solve_signature_kernel_calibration(x, f,
             reg = reg
         )
 
-        final_loss = forcing_loss(rhs_true, f_pred_final)
-
-        print(f"non-branched integrated-target loss: {final_loss.item():.3e}")
 
     return u, f_pred_final, alpha
 
