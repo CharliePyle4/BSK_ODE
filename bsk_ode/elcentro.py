@@ -32,6 +32,9 @@ def cumtrapz_torch(y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     return out
 
 def forcing_loss(true_forcing, approximated_forcing):
+    # Move both to CPU so subtraction is always valid
+    true_forcing = true_forcing.detach().to("cpu")
+    approximated_forcing = approximated_forcing.detach().to("cpu")
     residual = true_forcing - approximated_forcing
     loss = torch.mean(residual**2)
     return loss
