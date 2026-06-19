@@ -1196,7 +1196,7 @@ def print_normal_vs_tlift(
             f"{pct_imp(norm, tlift):>13.2f}%"
         )
 
-c
+
 
 ## Compare: Predict-Retrain vs Rolling Retrain
 
