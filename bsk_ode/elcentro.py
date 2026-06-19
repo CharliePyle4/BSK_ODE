@@ -176,10 +176,11 @@ def solvebetas(Ksig: torch.Tensor,
 
 
 def solve_signature_kernel(x, f,
-                                                k1, k2, k3,
-                                                ua, upa,
-                                                depth,
-                                                normalize = True):
+                        k1, k2, k3,
+                        ua, upa,
+                        depth,
+                        normalize = True,
+                        reg = 1e-10):
 
     with torch.no_grad():
 
@@ -205,6 +206,7 @@ def solve_signature_kernel(x, f,
             k1=k1,
             k2=k2,
             k3=k3,
+            reg = reg
         )
 
         final_loss = forcing_loss(rhs_true, f_pred_final)
@@ -265,3 +267,412 @@ def plot_calibration(time, F_star, F_hat, U_true, U_hat):
 
     fig.tight_layout()
     plt.show()
+
+
+def mse(pred, true):
+    return torch.mean((pred - true) ** 2).item()
+
+def rel_mse(pred, true):
+    return torch.mean((pred - true) ** 2).item() / torch.mean(true ** 2).item()
+
+
+def print_errors(F_pred, F_star,U_pred,U_true):
+    # Forcing errors
+    abs_mse_F = mse(F_pred, F_star)
+    rel_mse_F = rel_mse(F_pred, F_star)
+
+    # Solution errors
+    abs_mse_u = mse(U_pred, U_true)
+    rel_mse_u = rel_mse(U_pred, U_true)
+
+    print("\n==============================")
+    print("Model Error Summary")
+    print("==============================")
+    print(f"{'Quantity':20s} {'Absolute MSE':>18s} {'Relative MSE':>18s} {'Relative MSE (%)':>20s}")
+    print("-" * 80)
+    print(f"{'Forcing F*':20s} {abs_mse_F:>18.6e} {rel_mse_F:>18.6e} {100 * rel_mse_F:>19.4f}%")
+    print(f"{'Solution u(t)':20s} {abs_mse_u:>18.6e} {rel_mse_u:>18.6e} {100 * rel_mse_u:>19.4f}%")
+
+
+# -------------------------------------------------------
+# Signature + normalization helpers (rolling version)
+# -------------------------------------------------------
+
+def signature_of_path(path, depth: int = 8) -> torch.Tensor:
+    """Prefix signature of a single path (T, d) using keras_sig."""
+    if not isinstance(path, torch.Tensor):
+        path = torch.tensor(path, dtype=torch.float64)
+    if path.dim() == 2:
+        path = path.unsqueeze(0)                          # (1, T, d)
+    basepoint = path[:, 0:1, :]
+    path_bp   = torch.cat([basepoint, path], dim=1)       # prepend basepoint
+    sigs_raw  = keras_sig.signature(
+        path_bp,
+        depth=depth,
+        stream=False,                                     # single sig per path
+        gpu_optimized=True,
+    )
+    return sigs_raw.squeeze(0).to(device=device, dtype=torch.float64).detach()
+
+
+def robust_fit(S: torch.Tensor, eps: float = 1e-5):
+    """Return (median, IQR+eps) column-wise over S (N, D)."""
+    q75 = torch.quantile(S.double(), 0.75, dim=0)
+    q25 = torch.quantile(S.double(), 0.25, dim=0)
+    iqr = q75 - q25
+    N   = S.shape[0]
+    S_sorted = torch.sort(S, dim=0).values
+    med = S_sorted[N // 2] if N % 2 == 1 else (S_sorted[N // 2 - 1] + S_sorted[N // 2]) / 2.0
+    return med, iqr + eps
+
+
+def robust_apply(x: torch.Tensor, med: torch.Tensor, iqr: torch.Tensor) -> torch.Tensor:
+    return (x - med) / iqr
+
+
+# -------------------------------------------------------
+# Path construction
+# -------------------------------------------------------
+
+def build_paths(F_t: pd.DataFrame,
+                num_partitions: int,
+                t_lift_exp: float = 0.3):
+    """
+    Build prefix paths for branched (t-lift) and non-branched variants.
+
+    Returns:
+        paths_branched    : list of (T_i, 3) tensors  [t, f, t^exp]
+        paths_nonbranched : list of (T_i, 2) tensors  [t, f]
+    """
+    total_points   = len(F_t)
+    partition_size = total_points // num_partitions
+
+    paths_branched    = []
+    paths_nonbranched = []
+
+    for i in range(num_partitions):
+        end_index = (i + 1) * partition_size
+        if i == num_partitions - 1:
+            end_index = total_points
+
+        path_b  = []
+        path_nb = []
+        for j in range(end_index):
+            t_val = F_t.iloc[j, 0]
+            f_val = F_t.iloc[j, 1]
+            path_b.append([t_val, f_val, t_val ** t_lift_exp])
+            path_nb.append([t_val, f_val])
+
+        paths_branched.append(torch.tensor(path_b,  dtype=torch.float64))
+        paths_nonbranched.append(torch.tensor(path_nb, dtype=torch.float64))
+
+    return paths_branched, paths_nonbranched
+
+
+# -------------------------------------------------------
+# Initial training state
+# -------------------------------------------------------
+
+def build_state(paths, n0: int, signature_level: int,
+                m: float, c: float, k: float,
+                dt: float, N: int,
+                F_star: torch.Tensor,
+                t_vals: torch.Tensor,
+                u_true_interp: torch.Tensor) -> dict:
+    """
+    Train on the first n0+1 paths and return a state dict
+    ready for rolling_online_predict.
+    """
+    S0_raw = torch.stack([
+        signature_of_path(paths[i], depth=signature_level)
+        for i in range(n0 + 1)
+    ])
+
+    med, iqr = robust_fit(S0_raw)
+    S0 = robust_apply(S0_raw, med, iqr)
+
+    K0   = S0 @ S0.T
+    K1_0 = trapezoidal_cols(K0, dt)
+    K2_0 = trapezoidal_cols(K1_0, dt)
+
+    Psi0  = m * K0 + c * K1_0 + k * K2_0
+    rcond = torch.finfo(torch.float64).eps
+    alpha0 = torch.linalg.lstsq(
+        Psi0, F_star[:n0 + 1], rcond=rcond, driver='gelsd'
+    ).solution
+
+    F_pred_train = Psi0 @ alpha0
+    u_pred_train = K0   @ alpha0
+
+    return {
+        "m": m, "c": c, "k": k,
+        "dt": dt, "n0": n0, "N": N,
+        "paths": paths,
+        "signature_level": signature_level,
+        "med": med, "iqr": iqr,
+        "F_star": F_star,
+        "t_vals": t_vals,
+        "u_true_interp": u_true_interp,
+        "alpha0": alpha0,
+        "S_hist": S0.clone(),
+        "K_prev": K0[n0, :].clone(),
+        "I1": K1_0[n0, :].clone(),
+        "I2": K2_0[n0, :].clone(),
+        "F_pred_train": F_pred_train,
+        "u_pred_train": u_pred_train,
+    }
+
+
+# -------------------------------------------------------
+# Rolling online prediction
+# -------------------------------------------------------
+
+def rolling_online_predict(state: dict,
+                           retrain_every: int = 5,
+                           max_steps: int | None = None) -> dict:
+    """
+    Online sequential prediction with periodic full retraining.
+    """
+    m, c, k = state["m"], state["c"], state["k"]
+    dt    = state["dt"]
+    n0    = state["n0"]
+    N     = state["N"]
+    paths = state["paths"]
+    depth = state["signature_level"]
+    med, iqr = state["med"], state["iqr"]
+    F_star   = state["F_star"]
+
+    end_idx = N - 1 if max_steps is None else min(N - 1, n0 + max_steps)
+
+    S_hist = state["S_hist"].clone()
+    alphas = torch.zeros(end_idx + 1, dtype=torch.float64)
+    alphas[:n0 + 1] = state["alpha0"]
+
+    K_prev = state["K_prev"].clone()
+    I1 = state["I1"].clone()
+    I2 = state["I2"].clone()
+
+    F_pred = torch.zeros(end_idx + 1, dtype=torch.float64)
+    u_pred = torch.zeros(end_idx + 1, dtype=torch.float64)
+
+    F_pred[:n0 + 1] = state["F_pred_train"]
+    u_pred[:n0 + 1] = state["u_pred_train"]
+
+    retrain_indices = []
+    eps = 1e-3
+
+    for i in range(n0 + 1, end_idx + 1):
+        s_raw = signature_of_path(paths[i], depth=depth)
+        s_new = robust_apply(s_raw, med, iqr)
+
+        k_row_old = S_hist @ s_new
+        k_ii      = float(torch.dot(s_new, s_new).item())
+
+        I1_new = I1 + 0.5 * (K_prev + k_row_old) * dt
+        I2_new = I2 + 0.5 * (I1 + I1_new) * dt
+        I1, I2 = I1_new, I2_new
+        K_prev = k_row_old
+
+        col_i   = torch.cat([k_row_old, torch.tensor([k_ii], dtype=torch.float64)])
+        inner_i = trapezoidal_cols(col_i, dt)
+        outer_i = trapezoidal_cols(inner_i, dt)
+
+        I1 = torch.cat([I1, torch.tensor([float(inner_i[-1])], dtype=torch.float64)])
+        I2 = torch.cat([I2, torch.tensor([float(outer_i[-1])], dtype=torch.float64)])
+        K_prev = torch.cat([K_prev, torch.tensor([k_ii], dtype=torch.float64)])
+
+        psi_row_old = m * k_row_old + c * I1[:i] + k * I2[:i]
+        psi_diag    = m * k_ii + c * float(I1[i]) + k * float(I2[i])
+
+        residual = F_star[i] - torch.dot(psi_row_old, alphas[:i])
+        alphas[i] = residual / (psi_diag + eps)
+
+        F_pred[i] = torch.dot(psi_row_old, alphas[:i]) + psi_diag * alphas[i]
+        u_pred[i] = torch.dot(k_row_old,   alphas[:i]) + k_ii      * alphas[i]
+
+        S_hist = torch.vstack([S_hist, s_new.unsqueeze(0)])
+
+        if (i - n0) % retrain_every == 0:
+            print(f"[Retrain] at index {i}")
+            retrain_indices.append(i)
+
+            K      = S_hist @ S_hist.T
+            K1     = trapezoidal_cols(K, dt)
+            K2     = trapezoidal_cols(K1, dt)
+            Psi    = m * K + c * K1 + k * K2
+            Psi_bl = Psi[:i + 1, :i + 1]
+            F_bl   = F_star[:i + 1]
+
+            lam    = 1e-13 * torch.mean(torch.diag(Psi_bl))
+            I_mat  = torch.eye(i + 1, dtype=torch.float64)
+            alphas[:i + 1] = torch.linalg.solve(Psi_bl + lam * I_mat, F_bl)
+
+            F_pred[:i + 1] = Psi_bl @ alphas[:i + 1]
+            u_pred[:i + 1] = K[:i + 1, :i + 1] @ alphas[:i + 1]
+
+    return {
+        "F_pred": F_pred,
+        "u_pred": u_pred,
+        "retrain_indices": retrain_indices,
+        "end_idx": end_idx,
+    }
+
+
+def plot_branched_vs_nonbranched(
+    t_vals: torch.Tensor,
+    n0: int,
+    F_star: torch.Tensor,
+    F_pred_train_nb: torch.Tensor,
+    F_pred_train_b: torch.Tensor,
+    u_true_interp: torch.Tensor,
+    u_pred_train_nb: torch.Tensor,
+    u_pred_train_b: torch.Tensor,
+    res_nb: dict,
+    res_b: dict,
+):
+    """
+    2x2 plot: forcing and solution, non-branched vs branched (t-lift),
+    with train/test split and retrain markers.
+    """
+    # Plot style
+    plt.rcParams.update({
+        "font.family": "serif",
+        "font.size": 13,
+        "axes.labelsize": 15,
+        "axes.titlesize": 16,
+        "legend.fontsize": 12,
+        "xtick.labelsize": 12,
+        "ytick.labelsize": 12,
+        "axes.linewidth": 1.1,
+        "figure.dpi": 150,
+        "savefig.dpi": 300,
+        "savefig.bbox": "tight",
+    })
+
+    # Indices
+    idx_train   = torch.arange(0, n0 + 1)
+    idx_test_b  = torch.arange(n0 + 1, res_b["end_idx"]  + 1)
+    idx_test_nb = torch.arange(n0 + 1, res_nb["end_idx"] + 1)
+
+    t_train   = t_vals[idx_train]
+    t_test_b  = t_vals[idx_test_b]
+    t_test_nb = t_vals[idx_test_nb]
+    t_split   = float(t_vals[n0].item())
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+
+    # --- Top-left: Forcing, non-branched ---
+    ax = axes[0, 0]
+    ax.plot(t_train.tolist(), F_star[idx_train].tolist(),
+            color="black", linewidth=1.5, label="True f(t)")
+    ax.plot(t_train.tolist(), F_pred_train_nb.tolist(),
+            color="red", linestyle="--", linewidth=1.5)
+    ax.plot(t_test_nb.tolist(), F_star[idx_test_nb].tolist(),
+            color="black", linewidth=1.5)
+    ax.plot(t_test_nb.tolist(), res_nb["F_pred"][idx_test_nb].tolist(),
+            color="red", linestyle="--", linewidth=1.5, label="no t-lift pred f")
+    ax.axvline(x=t_split, color="gray", linestyle=":", linewidth=1.4, label="Train/test split")
+    ax.set_title("Forcing: no t-lift vs true")
+    ax.set_xlabel("t")
+    ax.set_ylabel("f(t)")
+    ax.legend(frameon=True, fancybox=False, edgecolor="black")
+
+    # --- Top-right: Forcing, branched ---
+    ax = axes[0, 1]
+    ax.plot(t_train.tolist(), F_star[idx_train].tolist(),
+            color="black", linewidth=1.5, label="True f(t)")
+    ax.plot(t_train.tolist(), F_pred_train_b.tolist(),
+            color="blue", linestyle="--", linewidth=1.5)
+    ax.plot(t_test_b.tolist(), F_star[idx_test_b].tolist(),
+            color="black", linewidth=1.5)
+    ax.plot(t_test_b.tolist(), res_b["F_pred"][idx_test_b].tolist(),
+            color="blue", linestyle="--", linewidth=1.5, label="t-lift pred f")
+    ax.axvline(x=t_split, color="gray", linestyle=":", linewidth=1.4, label="Train/test split")
+    ax.set_title("Forcing: t-lift vs true")
+    ax.set_xlabel("t")
+    ax.set_ylabel("f(t)")
+    ax.legend(frameon=True, fancybox=False, edgecolor="black")
+
+    # --- Bottom-left: Solution, non-branched ---
+    ax = axes[1, 0]
+    ax.plot(t_train.tolist(), u_true_interp[idx_train].tolist(),
+            color="black", linewidth=1.5, label="reference u(t)")
+    ax.plot(t_train.tolist(), u_pred_train_nb.tolist(),
+            color="red", linestyle="--", linewidth=1.5)
+    ax.plot(t_test_nb.tolist(), u_true_interp[idx_test_nb].tolist(),
+            color="black", linewidth=1.5)
+    ax.plot(t_test_nb.tolist(), res_nb["u_pred"][idx_test_nb].tolist(),
+            color="red", linestyle="--", linewidth=1.5, label="no t-lift prediction u(t)")
+    ax.axvline(x=t_split, color="gray", linestyle=":", linewidth=1.2, label="Train/test split")
+    ax.set_title("Solution: No t-lift vs Reference")
+    ax.set_xlabel("t")
+    ax.set_ylabel("u(t)")
+    ax.legend(frameon=True, fancybox=False, edgecolor="black")
+
+    # --- Bottom-right: Solution, branched ---
+    ax = axes[1, 1]
+    ax.plot(t_train.tolist(), u_true_interp[idx_train].tolist(),
+            color="black", linewidth=1.5, label="reference u(t)")
+    ax.plot(t_train.tolist(), u_pred_train_b.tolist(),
+            color="blue", linestyle="--", linewidth=1.5)
+    ax.plot(t_test_b.tolist(), u_true_interp[idx_test_b].tolist(),
+            color="black", linewidth=1.5)
+    ax.plot(t_test_b.tolist(), res_b["u_pred"][idx_test_b].tolist(),
+            color="blue", linestyle="--", linewidth=1.5, label="t-lift prediction u(t)")
+    ax.axvline(x=t_split, color="gray", linestyle=":", linewidth=1.2, label="Train/test split")
+    ax.set_title("Solution: t-lift vs Reference")
+    ax.set_xlabel("t")
+    ax.set_ylabel("u(t)")
+    ax.legend(frameon=True, fancybox=False, edgecolor="black")
+
+    fig.tight_layout()
+    plt.show()
+
+
+def summarize_branched_vs_nonbranched_errors(
+    t_vals: torch.Tensor,
+    n0: int,
+    F_star: torch.Tensor,
+    u_true_interp: torch.Tensor,
+    F_pred_train_nb: torch.Tensor,
+    F_pred_train_b: torch.Tensor,
+    u_pred_train_nb: torch.Tensor,
+    u_pred_train_b: torch.Tensor,
+    res_nb: dict,
+    res_b: dict,
+):
+    """
+    Print relative MSE table for forcing and solution:
+    non-branched vs t-lift branched, split into train / test.
+    """
+    def rel_mse(pred, true):
+        return torch.mean((pred - true) ** 2).item() / torch.mean(true ** 2).item()
+
+    def pct_imp(nb, b):
+        # percent improvement going from non-branched (nb) to branched (b)
+        return (nb - b) / abs(nb) * 100 if nb != 0 else float("nan")
+
+    # Indices
+    idx_train   = torch.arange(0, n0 + 1)
+    idx_test_b  = torch.arange(n0 + 1, res_b["end_idx"]  + 1)
+    idx_test_nb = torch.arange(n0 + 1, res_nb["end_idx"] + 1)
+
+    # Training relative MSEs
+    mse_train_F_nb = rel_mse(F_pred_train_nb, F_star[idx_train])
+    mse_train_u_nb = rel_mse(u_pred_train_nb, u_true_interp[idx_train])
+    mse_train_F_b  = rel_mse(F_pred_train_b,  F_star[idx_train])
+    mse_train_u_b  = rel_mse(u_pred_train_b,  u_true_interp[idx_train])
+
+    # Testing relative MSEs
+    mse_test_F_nb = rel_mse(res_nb["F_pred"][idx_test_nb], F_star[idx_test_nb])
+    mse_test_u_nb = rel_mse(res_nb["u_pred"][idx_test_nb], u_true_interp[idx_test_nb])
+    mse_test_F_b  = rel_mse(res_b["F_pred"][idx_test_b],   F_star[idx_test_b])
+    mse_test_u_b  = rel_mse(res_b["u_pred"][idx_test_b],   u_true_interp[idx_test_b])
+
+    # Print table
+    print(f"\n{'':25s} {'Non-Branched':>15} {'t-lift Branched':>16} {'% Improvement':>14}")
+    print("-" * 72)
+    print(f"{'Training forcing':25s} {mse_train_F_nb:>15.4e} {mse_train_F_b:>16.4e} {pct_imp(mse_train_F_nb, mse_train_F_b):>13.2f}%")
+    print(f"{'Training solution':25s} {mse_train_u_nb:>15.4e} {mse_train_u_b:>16.4e} {pct_imp(mse_train_u_nb, mse_train_u_b):>13.2f}%")
+    print(f"{'Testing forcing':25s} {mse_test_F_nb:>15.4e} {mse_test_F_b:>16.4e} {pct_imp(mse_test_F_nb, mse_test_F_b):>13.2f}%")
+    print(f"{'Testing solution':25s} {mse_test_u_nb:>15.4e} {mse_test_u_b:>16.4e} {pct_imp(mse_test_u_nb, mse_test_u_b):>13.2f}%")
