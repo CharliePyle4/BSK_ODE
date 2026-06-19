@@ -487,7 +487,7 @@ def solve_signature_kernel_predict_retrain(
 
     return u_pred_full, f_pred_full
 
-c
+
 
 
 
@@ -531,9 +531,9 @@ def robust_apply(x: torch.Tensor, med: torch.Tensor, iqr: torch.Tensor) -> torch
 
 
 # -------------------------------------------------------
-# Path construction
+# old Rolling online prediction functions
 # -------------------------------------------------------
-
+'''
 def build_paths(F_t: pd.DataFrame,
                 num_partitions: int,
                 t_lift_exp: float = 0.3):
@@ -569,9 +569,6 @@ def build_paths(F_t: pd.DataFrame,
     return paths_branched, paths_nonbranched
 
 
-# -------------------------------------------------------
-# Initial training state
-# -------------------------------------------------------
 def build_state(paths,
                 n0: int,
                 signature_level: int,
@@ -631,9 +628,7 @@ def build_state(paths,
         "u_pred_train": u_pred_train,
     }
 
-# -------------------------------------------------------
-# Rolling online prediction
-# -------------------------------------------------------
+
 def rolling_online_predict(state: dict,
                            retrain_every: int = 5,
                            max_steps: int | None = None) -> dict:
@@ -723,6 +718,7 @@ def rolling_online_predict(state: dict,
         "retrain_indices": retrain_indices,
         "end_idx": end_idx,
     }
+'''
 
 def rolling_update_step(
     beta_prev: torch.Tensor,
@@ -736,6 +732,8 @@ def rolling_update_step(
     upa: float,
     depth: int,
     normalize: bool = True,
+    use_tlift: bool = False,
+    holder_value=None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Perform one rolling update step (no full retrain).
@@ -745,14 +743,23 @@ def rolling_update_step(
         f_new    : predicted forcing at t_curr[-1]
         beta_new : updated coefficient vector including alpha_new
     """
+    if use_tlift and holder_value is None:
+        raise ValueError("holder_value must be provided when use_tlift=True")
+
     # Build current path and signatures
-    X_curr    = torch.stack([t_curr, f_curr], dim=1)
+    X_curr = torch.stack([t_curr, f_curr], dim=1)
+
+    if use_tlift:
+        X_curr = tlift(X_curr, holder_value)
+
     X_sig_cur = compute_signatures(X_curr, depth)
 
     if normalize:
-        # Normalize current signatures with statistics from training signatures
         _, X_sig_cur = apply_signature_normalization_pair(
-            X_sig_train, X_sig_cur, depth=depth, dim=X_curr.shape[1]
+            X_sig_train,
+            X_sig_cur,
+            depth=depth,
+            dim=X_curr.shape[1],
         )
 
     # Full kernel on current points
@@ -761,102 +768,132 @@ def rolling_update_step(
 
     # Row for the new point vs all previous points
     phi_K0_row = K0[-1, :-1]
-    I1_row     = I1K[-1, :-1]
-    I2_row     = I2K[-1, :-1]
+    I1_row = I1K[-1, :-1]
+    I2_row = I2K[-1, :-1]
 
     # Diagonal entries for the new point
-    k_diag  = K0[-1, -1]
+    k_diag = K0[-1, -1]
     I1_diag = I1K[-1, -1]
     I2_diag = I2K[-1, -1]
 
     # Operator row/diag at the new point
     phi_row_old = k1 * phi_K0_row + k2 * I1_row + k3 * I2_row
-    phi_diag    = k1 * k_diag      + k2 * I1_diag + k3 * I2_diag
+    phi_diag = k1 * k_diag + k2 * I1_diag + k3 * I2_diag
 
     # One-step residual update at the new point
-    eps_denom  = 1e-12
+    eps_denom = 1e-12
     target_new = f_curr[-1]
-    alpha_new  = (target_new - torch.dot(phi_row_old, beta_prev)) / (phi_diag + eps_denom)
+    alpha_new = (target_new - torch.dot(phi_row_old, beta_prev)) / (phi_diag + eps_denom)
 
     # Extend coefficients
     beta_new = torch.cat([beta_prev, alpha_new.unsqueeze(0)], dim=0)
 
     # Evaluate full solution/forcing and take last entries
-    u_all, Iu, I2u = evaluate_solution_from_beta(K0, I1K, I2K, t_curr, beta_new, ua, upa)
-    f_pred_all     = evaluate_forcing_from_solution(u_all, Iu, I2u, k1, k2, k3)
+    u_all, Iu, I2u = evaluate_solution_from_beta(
+        K0, I1K, I2K, t_curr, beta_new, ua, upa
+    )
+    f_pred_all = evaluate_forcing_from_solution(u_all, Iu, I2u, k1, k2, k3)
 
     u_new = u_all[-1]
     f_new = f_pred_all[-1]
 
     return u_new, f_new, beta_new
 
+
 def solve_signature_kernel_rolling_retrain(
     t_train: torch.Tensor,
-    t_test:  torch.Tensor,
+    t_test: torch.Tensor,
     f_train: torch.Tensor,
-    f_test:  torch.Tensor,
+    f_test: torch.Tensor,
     k1, k2, k3,
     ua, upa,
-    depth, normalize=True, reg=1e-10,
+    depth,
+    normalize: bool = True,
+    reg: float = 1e-10,
     retrain_every: int = 10,
+    use_tlift: bool = False,
+    holder_value=None,
 ):
     """
-    Non-branched testing with periodic retraining, with a
-    consistent rolling update of the coefficients.
+    Non-branched rolling testing with periodic retraining.
+
+    Uses:
+      - solve_signature_kernel_calibration for initial fit and full retrains
+      - rolling_update_step for one-step rolling coefficient updates between retrains
     """
-    u_pred_full = []
-    f_pred_full = []
+
+    if use_tlift and holder_value is None:
+        raise ValueError("holder_value must be provided when use_tlift=True")
 
     with torch.no_grad():
-        # ----- Initial train -----
-        X_train     = torch.stack([t_train, f_train], dim=1)
+        # Initial calibration on training set
+        u_pred_train, f_pred_train, beta = solve_signature_kernel_calibration(
+            x=t_train,
+            f=f_train,
+            k1=k1, k2=k2, k3=k3,
+            ua=ua, upa=upa,
+            depth=depth,
+            normalize=normalize,
+            reg=reg,
+            use_tlift=use_tlift,
+            holder_value=holder_value,
+        )
+
+        u_pred_full = u_pred_train.clone()
+        f_pred_full = f_pred_train.clone()
+
+        # Build/store current training signatures
+        X_train = torch.stack([t_train, f_train], dim=1)
+        if use_tlift:
+            X_train = tlift(X_train, holder_value)
+
         X_sig_train = compute_signatures(X_train, depth)
         if normalize:
             X_sig_train = normalize_signatures(
-                Z=X_sig_train, depth=depth, dim=X_train.shape[1]
+                Z=X_sig_train,
+                depth=depth,
+                dim=X_train.shape[1],
             )
-        Ksig_train = build_kernel_from_signatures(X_sig_train)
 
-        # beta_w is the coefficient vector for all points in t_train
-        beta_w, u_pred_train, f_pred_train, rhs_true_train = solvebetas(
-            Ksig=Ksig_train, f=f_train, x=t_train,
-            ua=ua, upa=upa, k1=k1, k2=k2, k3=k3, reg=reg
-        )
-        u_pred_full = u_pred_train.clone()
-        f_pred_full = f_pred_train.clone()
-        print(
-            "initial train integrated-target loss: "
-            f"{forcing_loss(rhs_true_train, f_pred_train).item():.3e}"
-        )
+        N_test = t_test.numel()
 
-        N_train = t_train.numel()
-        N_test  = t_test.numel()
-
-        # ----- Rolling over test points -----
         for j in range(1, N_test + 1):
-            t_curr = torch.cat([t_train, t_test[:j]], dim=0)
-            f_curr = torch.cat([f_train, f_test[:j]], dim=0)
-
-            # Full retrain at schedule
             if (j % retrain_every) == 0:
-                X_train     = torch.stack([t_curr, f_curr], dim=1)
-                X_sig_train = compute_signatures(X_train, depth)
+                t_fit = torch.cat([t_train, t_test[:j]], dim=0)
+                f_fit = torch.cat([f_train, f_test[:j]], dim=0)
+
+                _, _, beta = solve_signature_kernel_calibration(
+                    x=t_fit,
+                    f=f_fit,
+                    k1=k1, k2=k2, k3=k3,
+                    ua=ua, upa=upa,
+                    depth=depth,
+                    normalize=normalize,
+                    reg=reg,
+                    use_tlift=use_tlift,
+                    holder_value=holder_value,
+                )
+
+                X_fit = torch.stack([t_fit, f_fit], dim=1)
+                if use_tlift:
+                    X_fit = tlift(X_fit, holder_value)
+
+                X_sig_train = compute_signatures(X_fit, depth)
                 if normalize:
                     X_sig_train = normalize_signatures(
-                        Z=X_sig_train, depth=depth, dim=X_train.shape[1]
+                        Z=X_sig_train,
+                        depth=depth,
+                        dim=X_fit.shape[1],
                     )
-                Ksig_train = build_kernel_from_signatures(X_sig_train)
-                beta_w, u_pred_train, f_pred_train, rhs_true_train = solvebetas(
-                    Ksig=Ksig_train, f=f_curr, x=t_curr,
-                    ua=ua, upa=upa, k1=k1, k2=k2, k3=k3, reg=reg
-                )
-                # Append only the newest point
-                u_pred_full = torch.cat([u_pred_full, u_pred_train[-1:]], dim=0)
-                f_pred_full = torch.cat([f_pred_full, f_pred_train[-1:]], dim=0)
-                continue
 
-            u_new, f_new, beta_w = rolling_update_step(
-                beta_prev=beta_w,
+                t_curr = t_fit
+                f_curr = f_fit
+            else:
+                t_curr = torch.cat([t_train, t_test[:j]], dim=0)
+                f_curr = torch.cat([f_train, f_test[:j]], dim=0)
+
+            u_new, f_new, beta = rolling_update_step(
+                beta_prev=beta,
                 X_sig_train=X_sig_train,
                 t_curr=t_curr,
                 f_curr=f_curr,
@@ -867,102 +904,19 @@ def solve_signature_kernel_rolling_retrain(
                 upa=upa,
                 depth=depth,
                 normalize=normalize,
+                use_tlift=use_tlift,
+                holder_value=holder_value,
             )
 
-    t_all      = torch.cat([t_train, t_test], dim=0)
-    f_all      = torch.cat([f_train, f_test], dim=0)
+            u_pred_full = torch.cat([u_pred_full, u_new.unsqueeze(0)], dim=0)
+            f_pred_full = torch.cat([f_pred_full, f_new.unsqueeze(0)], dim=0)
+
+    t_all = torch.cat([t_train, t_test], dim=0)
+    f_all = torch.cat([f_train, f_test], dim=0)
     final_loss = forcing_loss(f_all, f_pred_full)
-    print(f"final forcing loss (train+test, last beta): {final_loss.item():.3e}")
+    print(f"final forcing loss (train+test, rolling): {final_loss.item():.3e}")
+
     return u_pred_full, f_pred_full
-
-def solve_signature_kernel_rolling_retrain_tlift(
-    t_train: torch.Tensor,
-    t_test:  torch.Tensor,
-    f_train: torch.Tensor,
-    f_test:  torch.Tensor,
-    k1, k2, k3,
-    ua, upa,
-    depth, normalize=True, tlift_value=0.5, reg=1e-10,
-    retrain_every: int = 10,
-):
-    """
-    Non-branched testing with periodic retraining + Hölder time-lift.
-    Identical to solve_signature_kernel_rolling_retrain but every path
-    tensor is passed through tlift(...) before computing signatures.
-    """
-    u_pred_full = []
-    f_pred_full = []
-
-    with torch.no_grad():
-        X_train     = tlift(torch.stack([t_train, f_train], dim=1), tlift_value)
-        X_sig_train = compute_signatures(X_train, depth)
-        if normalize:
-            X_sig_train = normalize_signatures(Z=X_sig_train, depth=depth, dim=X_train.shape[1])
-        Ksig_train = build_kernel_from_signatures(X_sig_train)
-        beta_w, u_pred_train, f_pred_train, rhs_true_train = solvebetas(
-            Ksig=Ksig_train, f=f_train, x=t_train,
-            ua=ua, upa=upa, k1=k1, k2=k2, k3=k3, reg=reg)
-        u_pred_full = u_pred_train.clone()
-        f_pred_full = f_pred_train.clone()
-        print(f"initial train integrated-target loss: "
-              f"{forcing_loss(rhs_true_train, f_pred_train).item():.3e}")
-
-        N_train = t_train.numel()
-        N_test  = t_test.numel()
-
-        for j in range(1, N_test + 1):
-            t_curr = torch.cat([t_train, t_test[:j]], dim=0)
-            f_curr = torch.cat([f_train, f_test[:j]], dim=0)
-
-            if (j % retrain_every) == 0:
-                X_train     = tlift(torch.stack([t_curr, f_curr], dim=1), tlift_value)
-                X_sig_train = compute_signatures(X_train, depth)
-                if normalize:
-                    X_sig_train = normalize_signatures(Z=X_sig_train, depth=depth, dim=X_train.shape[1])
-                Ksig_train  = build_kernel_from_signatures(X_sig_train)
-                beta_w, u_pred_train, f_pred_train, rhs_true_train = solvebetas(
-                    Ksig=Ksig_train, f=f_curr, x=t_curr,
-                    ua=ua, upa=upa, k1=k1, k2=k2, k3=k3, reg=reg)
-                u_pred_full = torch.cat([u_pred_full, u_pred_train[-1:]], dim=0)
-                f_pred_full = torch.cat([f_pred_full, f_pred_train[-1:]], dim=0)
-                continue
-
-            X_curr    = tlift(torch.stack([t_curr, f_curr], dim=1), tlift_value)
-            X_sig_cur = compute_signatures(X_curr, depth)
-            if normalize:
-                _, X_sig_cur = apply_signature_normalization_pair(
-                    X_sig_train, X_sig_cur, depth=depth, dim=X_curr.shape[1])
-
-            dt = (t_curr[-1] - t_curr[-2]).item()
-
-            phi_K0_row = build_kernel_from_different_signatures(
-                X_sig_cur[-1:], X_sig_cur[:-1]).squeeze(0)
-            k_diag     = torch.dot(X_sig_cur[-1], X_sig_cur[-1])
-
-            K_col  = torch.cat([phi_K0_row, k_diag.unsqueeze(0)], dim=0)
-            I1_col = trapezoidal_cols(K_col.unsqueeze(1), dt).squeeze(1)
-            I2_col = trapezoidal_cols(I1_col.unsqueeze(1), dt).squeeze(1)
-
-            phi_row_old = k1 * phi_K0_row + k2 * I1_col[:-1] + k3 * I2_col[:-1]
-            phi_diag    = k1 * k_diag.item() + k2 * float(I1_col[-1]) + k3 * float(I2_col[-1])
-
-            alpha_new = (f_test[j-1] - torch.dot(phi_row_old, beta_w)) / (phi_diag + 1e-12)
-            alphas    = torch.cat([beta_w, alpha_new.unsqueeze(0)], dim=0)
-
-            Ksig_full      = build_kernel_from_signatures(X_sig_cur)
-            K0, I1K, I2K   = buildkerneloperators(Ksig_full, t_curr)
-            u_all, Iu, I2u = evaluate_solution_from_beta(K0, I1K, I2K, t_curr, alphas, ua, upa)
-            f_pred_all     = evaluate_forcing_from_solution(u_all, Iu, I2u, k1, k2, k3)
-
-            u_pred_full = torch.cat([u_pred_full, u_all[-1:]], dim=0)
-            f_pred_full = torch.cat([f_pred_full, f_pred_all[-1:]], dim=0)
-
-    t_all      = torch.cat([t_train, t_test], dim=0)
-    f_all      = torch.cat([f_train, f_test], dim=0)
-    final_loss = forcing_loss(f_all, f_pred_full)
-    print(f"final forcing loss (train+test, last beta): {final_loss.item():.3e}")
-    return u_pred_full, f_pred_full
-#Error printing and plotting functions
 
 def mse(pred, true):
     pred = pred.to(true.device)
@@ -1242,7 +1196,7 @@ def print_normal_vs_tlift(
             f"{pct_imp(norm, tlift):>13.2f}%"
         )
 
-
+c
 
 ## Compare: Predict-Retrain vs Rolling Retrain
 
