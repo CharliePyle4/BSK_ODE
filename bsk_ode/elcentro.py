@@ -383,8 +383,9 @@ def predict_signature_kernel(
         )
 
         # Evaluate solution and forcing
+        # Correct operator ordering: K0=u operator, IK=∫u operator, I2K=∫∫u operator
         u_eval, u_p_eval, u_dd_eval = evaluate_solution_from_beta(
-            Ku2_eval, Kup_eval, Ku_eval, x_eval, alpha, ua, upa
+            Ku_eval, Kup_eval, Ku2_eval, x_eval, alpha, ua, upa
         )
         f_eval_pred = evaluate_forcing_from_solution(
             u_eval, u_p_eval, u_dd_eval, k1, k2, k3
