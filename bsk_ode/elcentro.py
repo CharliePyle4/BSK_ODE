@@ -287,7 +287,86 @@ def tlift(X, holder_value):
     X_tlift = torch.cat([X, x_lift], dim=1)
     return X_tlift
 
+def _matrix_stats(M, name, reg=0):
+    dtype = torch.float64
+    device = M.device
+    M = M.to(dtype=dtype, device=device)
 
+    try:
+        s = torch.linalg.svdvals(M)
+        smax = s.max()
+        smin = s.min()
+
+        cond = (smax / torch.clamp(smin, min=reg)).item()
+        rcond = (torch.clamp(smin, min=reg) / torch.clamp(smax, min=reg)).item()
+        rank = torch.linalg.matrix_rank(M).item()
+
+    except RuntimeError:
+        MtM = M.T @ M
+        evals = torch.linalg.eigvalsh(MtM)
+        evals = torch.clamp(evals, min=reg)
+        s = torch.sqrt(evals)
+        smax = s.max()
+        smin = s.min()
+
+        cond = (smax / torch.clamp(smin, min=reg)).item()
+        rcond = (torch.clamp(smin, min=reg) / torch.clamp(smax, min=reg)).item()
+        rank = torch.linalg.matrix_rank(M).item()
+
+    print(f"{name:10s} | shape={tuple(M.shape)} | rank={rank:4d} | rcond={rcond:.3e} | cond={cond:.3e}")
+
+
+def diagnose_conditioning(x, f,
+                        k1, k2, k3,
+                        ua, upa,
+                        depth,
+                        reg = 1e-10,
+                        use_tlift=False,
+                        holder_value=None):
+    
+    dtype = torch.float64
+    device = torch.device("cuda")
+
+    with torch.no_grad():
+
+        #build path
+        X = torch.stack([x, f], dim=1)           # (T,2)
+        if use_tlift:
+            if holder_value is None:
+                raise ValueError("holder_value must be provided when use_tlift=True")
+            X = tlift(X, holder_value)
+
+        #non normalized
+        X_sig = compute_signatures(X, depth)
+        Ksig = build_kernel_from_signatures(X_sig)
+        K0, IK, I2K = buildkerneloperators(Ksig, x)
+        A = k1 * K0 + k2 * IK + k3 * I2K
+
+        #normalized
+        X_sig_norm = normalize_signatures(Z=X_sig,depth=depth,dim=X.shape[1])
+        Ksig_norm = build_kernel_from_signatures(X_sig_norm)
+        K0_norm, IK_norm, I2K_norm = buildkerneloperators(Ksig_norm, x)
+        A_norm = k1 * K0_norm + k2 * IK_norm + k3 * I2K_norm
+
+        #Diagnose and print conditioning number, rcond, and rank for each
+        
+        print("\n--- non-normalized ---")
+        _matrix_stats(X_sig,   "X_sig")
+        _matrix_stats(Ksig,    "Ksig")
+        _matrix_stats(K0,      "K0")
+        _matrix_stats(IK,      "IK")
+        _matrix_stats(I2K,     "I2K")
+        _matrix_stats(A,       "A")
+
+        print("\n--- normalized ---")
+        _matrix_stats(X_sig_norm, "X_sig_n")
+        _matrix_stats(Ksig_norm,  "Ksig_n")
+        _matrix_stats(K0_norm,    "K0_n")
+        _matrix_stats(IK_norm,    "IK_n")
+        _matrix_stats(I2K_norm,   "I2K_n")
+        _matrix_stats(A_norm,     "A_n")
+
+        return 
 
 
 
