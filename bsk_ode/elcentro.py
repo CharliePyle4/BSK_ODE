@@ -297,7 +297,7 @@ def print_errors(F_pred, F_star, U_pred, U_true):
     print("-" * 80)
     print(f"{'Forcing F*':20s} {abs_mse_F:>18.6e} {rel_mse_F:>18.6e} {100 * rel_mse_F:>19.4f}%")
     print(f"{'Solution u(t)':20s} {abs_mse_u:>18.6e} {rel_mse_u:>18.6e} {100 * rel_mse_u:>19.4f}%")
-Al
+
 
 # -------------------------------------------------------
 # Signature + normalization helpers (rolling version)
