@@ -290,36 +290,10 @@ def solve_signature_kernel(x, f,
 
     return u, f_pred_final
 
-def mse(pred, true):
-    pred = pred.to(true.device)
-    return torch.mean((pred - true) ** 2).item()
 
 
-def rel_mse(pred, true):
-    pred = pred.to(true.device)
-    return torch.mean((pred - true) ** 2).item() / torch.mean(true ** 2).item()
 
 
-def print_errors(F_pred, F_star, U_pred, U_true):
-    # Ensure predictions on same device as references
-    F_pred = F_pred.to(F_star.device)
-    U_pred = U_pred.to(U_true.device)
-
-    # Forcing errors
-    abs_mse_F = mse(F_pred, F_star)
-    rel_mse_F = rel_mse(F_pred, F_star)
-
-    # Solution errors
-    abs_mse_u = mse(U_pred, U_true)
-    rel_mse_u = rel_mse(U_pred, U_true)
-
-    print("\n==============================")
-    print("Model Error Summary")
-    print("==============================")
-    print(f"{'Quantity':20s} {'Absolute MSE':>18s} {'Relative MSE':>18s} {'Relative MSE (%)':>20s}")
-    print("-" * 80)
-    print(f"{'Forcing F*':20s} {abs_mse_F:>18.6e} {rel_mse_F:>18.6e} {100 * rel_mse_F:>19.4f}%")
-    print(f"{'Solution u(t)':20s} {abs_mse_u:>18.6e} {rel_mse_u:>18.6e} {100 * rel_mse_u:>19.4f}%")
 
 def solve_signature_kernel_predict_retrain(
     t_train: torch.Tensor,
@@ -513,277 +487,6 @@ def tlift(X, holder_value):
 
 
 
-
-
-def plot_calibration(time, F_star, F_hat, U_true, U_hat):
-    """
-    Plot calibration results.
-
-    Parameters
-    ----------
-    time   : array-like  (T,)  — time grid
-    F_star : tensor/array (T,) — reference double-integrated forcing
-    F_hat  : tensor/array (T,) — model-predicted double-integrated forcing
-    U_true : tensor/array (T,) — reference solution u(t)
-    U_hat  : tensor/array (T,) — reconstructed solution u(t)
-    """
-    # Convert tensors to plain lists for matplotlib
-    def _to_list(x):
-        if isinstance(x, torch.Tensor):
-            return x.detach().cpu().tolist()
-        return list(x)
-
-    time_list   = _to_list(time)
-    F_star_list = _to_list(F_star)
-    F_hat_list  = _to_list(F_hat)
-    U_true_list = _to_list(U_true)
-    U_hat_list  = _to_list(U_hat)        # ← was incorrectly K_A
-
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-
-    # Left: Forcing
-    axes[0].plot(time_list, F_star_list,
-                 color="black", linewidth=1.5, label="Reference Forcing")
-    axes[0].plot(time_list, F_hat_list,
-                 color="blue", linestyle="--", linewidth=1.5, label="Calibrated Forcing")
-    axes[0].set_title("Double Integral Forcing Fit")
-    axes[0].set_xlabel("t")
-    axes[0].set_ylabel("$\\iint f(t)$")
-    axes[0].legend(frameon=True, fancybox=False, edgecolor="black")
-    axes[0].grid(True, alpha=0.3)
-
-    # Right: Solution
-    axes[1].plot(time_list, U_true_list,
-                 color="black", linewidth=1.5, label="Reference $u(t)$")
-    axes[1].plot(time_list, U_hat_list,          # ← fixed: was K_A
-                 color="blue", linestyle="--", linewidth=1.5, label="Reconstructed $u(t)$")
-    axes[1].set_title("Solution Reconstruction")
-    axes[1].set_xlabel("t")
-    axes[1].set_ylabel("$u(t)$")
-    axes[1].legend(frameon=True, fancybox=False, edgecolor="black")
-    axes[1].grid(True, alpha=0.3)
-
-    fig.tight_layout()
-    plt.show()
-
-
-def mse(pred, true):
-    pred = pred.to(true.device)
-    return torch.mean((pred - true) ** 2).item()
-
-def rel_mse(pred, true):
-    pred = pred.to(true.device)
-    return torch.mean((pred - true) ** 2).item() / torch.mean(true ** 2).item()
-
-
-
-
-def plot_normal_vs_tlift(
-    t_vals: torch.Tensor,
-    TRAIN_FRAC: float,
-    u_pred_full: torch.Tensor,
-    f_pred_full: torch.Tensor,
-    u_pred_full_tlift: torch.Tensor,
-    f_pred_full_tlift: torch.Tensor,
-    U_ref: torch.Tensor,
-    F_star: torch.Tensor,
-):
-    """
-    2x2 plot: forcing and solution, normal vs t-lift,
-    with a vertical line at the train/test split.
-    """
-    # Indices and split
-    N        = t_vals.numel()
-    N_train  = int(N * TRAIN_FRAC)
-    idx_train = torch.arange(0, N_train)
-    idx_test  = torch.arange(N_train, N)
-
-    t_train = t_vals[idx_train]
-    t_test  = t_vals[idx_test]
-    t_split = float(t_vals[N_train - 1].item())
-
-    # Convert to lists for matplotlib
-    def _tolist(x):
-        if isinstance(x, torch.Tensor):
-            return x.detach().cpu().tolist()
-        return list(x)
-
-    t_train_l = _tolist(t_train)
-    t_test_l  = _tolist(t_test)
-
-    F_star_train_l = _tolist(F_star[idx_train])
-    F_star_test_l  = _tolist(F_star[idx_test])
-
-    f_norm_train_l = _tolist(f_pred_full[idx_train])
-    f_norm_test_l  = _tolist(f_pred_full[idx_test])
-
-    f_tlift_train_l = _tolist(f_pred_full_tlift[idx_train])
-    f_tlift_test_l  = _tolist(f_pred_full_tlift[idx_test])
-
-    u_ref_train_l = _tolist(U_ref[idx_train])
-    u_ref_test_l  = _tolist(U_ref[idx_test])
-
-    u_norm_train_l = _tolist(u_pred_full[idx_train])
-    u_norm_test_l  = _tolist(u_pred_full[idx_test])
-
-    u_tlift_train_l = _tolist(u_pred_full_tlift[idx_train])
-    u_tlift_test_l  = _tolist(u_pred_full_tlift[idx_test])
-
-    # Plot style (reuse style from other helpers)
-    plt.rcParams.update({
-        "font.family": "serif",
-        "font.size": 13,
-        "axes.labelsize": 15,
-        "axes.titlesize": 16,
-        "legend.fontsize": 12,
-        "xtick.labelsize": 12,
-        "ytick.labelsize": 12,
-        "axes.linewidth": 1.1,
-        "figure.dpi": 150,
-        "savefig.dpi": 300,
-        "savefig.bbox": "tight",
-    })
-
-    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
-
-    # --- Top-left: Forcing, normal ---
-    ax = axes[0, 0]
-    ax.plot(t_train_l, F_star_train_l,
-            color="black", linewidth=1.5, label="True F*")
-    ax.plot(t_train_l, f_norm_train_l,
-            color="red", linestyle="--", linewidth=1.5)
-    ax.plot(t_test_l,  F_star_test_l,
-            color="black", linewidth=1.5)
-    ax.plot(t_test_l,  f_norm_test_l,
-            color="red", linestyle="--", linewidth=1.5,
-            label="normal pred F*")
-    ax.axvline(x=t_split, color="gray", linestyle=":", linewidth=1.4,
-               label="Train/test split")
-    ax.set_title("Forcing: normal vs true")
-    ax.set_xlabel("t")
-    ax.set_ylabel("F*(t)")
-    ax.legend(frameon=True, fancybox=False, edgecolor="black")
-
-    # --- Top-right: Forcing, t-lift ---
-    ax = axes[0, 1]
-    ax.plot(t_train_l, F_star_train_l,
-            color="black", linewidth=1.5, label="True F*")
-    ax.plot(t_train_l, f_tlift_train_l,
-            color="blue", linestyle="--", linewidth=1.5)
-    ax.plot(t_test_l,  F_star_test_l,
-            color="black", linewidth=1.5)
-    ax.plot(t_test_l,  f_tlift_test_l,
-            color="blue", linestyle="--", linewidth=1.5,
-            label="t-lift pred F*")
-    ax.axvline(x=t_split, color="gray", linestyle=":", linewidth=1.4,
-               label="Train/test split")
-    ax.set_title("Forcing: t-lift vs true")
-    ax.set_xlabel("t")
-    ax.set_ylabel("F*(t)")
-    ax.legend(frameon=True, fancybox=False, edgecolor="black")
-
-    # --- Bottom-left: Solution, normal ---
-    ax = axes[1, 0]
-    ax.plot(t_train_l, u_ref_train_l,
-            color="black", linewidth=1.5, label="reference u(t)")
-    ax.plot(t_train_l, u_norm_train_l,
-            color="red", linestyle="--", linewidth=1.5)
-    ax.plot(t_test_l,  u_ref_test_l,
-            color="black", linewidth=1.5)
-    ax.plot(t_test_l,  u_norm_test_l,
-            color="red", linestyle="--", linewidth=1.5,
-            label="normal pred u(t)")
-    ax.axvline(x=t_split, color="gray", linestyle=":", linewidth=1.2,
-               label="Train/test split")
-    ax.set_title("Solution: normal vs reference")
-    ax.set_xlabel("t")
-    ax.set_ylabel("u(t)")
-    ax.legend(frameon=True, fancybox=False, edgecolor="black")
-
-    # --- Bottom-right: Solution, t-lift ---
-    ax = axes[1, 1]
-    ax.plot(t_train_l, u_ref_train_l,
-            color="black", linewidth=1.5, label="reference u(t)")
-    ax.plot(t_train_l, u_tlift_train_l,
-            color="blue", linestyle="--", linewidth=1.5)
-    ax.plot(t_test_l,  u_ref_test_l,
-            color="black", linewidth=1.5)
-    ax.plot(t_test_l,  u_tlift_test_l,
-            color="blue", linestyle="--", linewidth=1.5,
-            label="t-lift pred u(t)")
-    ax.axvline(x=t_split, color="gray", linestyle=":", linewidth=1.2,
-               label="Train/test split")
-    ax.set_title("Solution: t-lift vs reference")
-    ax.set_xlabel("t")
-    ax.set_ylabel("u(t)")
-    ax.legend(frameon=True, fancybox=False, edgecolor="black")
-
-    fig.tight_layout()
-    plt.show()
-
-
-def print_normal_vs_tlift(
-    t_vals: torch.Tensor,
-    TRAIN_FRAC: float,
-    u_pred_full: torch.Tensor,
-    f_pred_full: torch.Tensor,
-    u_pred_full_tlift: torch.Tensor,
-    f_pred_full_tlift: torch.Tensor,
-    U_ref: torch.Tensor,
-    F_star: torch.Tensor,
-):
-    """
-    Print relative MSE table for forcing and solution:
-    normal vs t-lift, split into train / test.
-    """
-    # Indices
-    N        = t_vals.numel()
-    N_train  = int(N * TRAIN_FRAC)
-    idx_train = torch.arange(0, N_train)
-    idx_test  = torch.arange(N_train, N)
-
-    def rel_mse(pred, true):
-        pred = pred.to(true.device)
-        return torch.mean((pred - true) ** 2).item() / torch.mean(true ** 2).item()
-
-    def pct_imp(nb, b):
-        # percent improvement going from normal (nb) to t-lift (b)
-        return (nb - b) / abs(nb) * 100 if nb != 0 else float("nan")
-
-    # Training relative MSEs
-    mse_train_F_norm   = rel_mse(f_pred_full[idx_train],         F_star[idx_train])
-    mse_train_u_norm   = rel_mse(u_pred_full[idx_train],         U_ref[idx_train])
-    mse_train_F_tlift  = rel_mse(f_pred_full_tlift[idx_train],   F_star[idx_train])
-    mse_train_u_tlift  = rel_mse(u_pred_full_tlift[idx_train],   U_ref[idx_train])
-
-    # Testing relative MSEs
-    mse_test_F_norm   = rel_mse(f_pred_full[idx_test],         F_star[idx_test])
-    mse_test_u_norm   = rel_mse(u_pred_full[idx_test],         U_ref[idx_test])
-    mse_test_F_tlift  = rel_mse(f_pred_full_tlift[idx_test],   F_star[idx_test])
-    mse_test_u_tlift  = rel_mse(u_pred_full_tlift[idx_test],   U_ref[idx_test])
-
-    print(f"\n{'':25s} {'Normal':>15} {'t-lift':>16} {'% Improvement':>14}")
-    print("-" * 72)
-    print(
-        f"{'Training forcing':25s} "
-        f"{mse_train_F_norm:>15.4e} {mse_train_F_tlift:>16.4e} "
-        f"{pct_imp(mse_train_F_norm, mse_train_F_tlift):>13.2f}%"
-    )
-    print(
-        f"{'Training solution':25s} "
-        f"{mse_train_u_norm:>15.4e} {mse_train_u_tlift:>16.4e} "
-        f"{pct_imp(mse_train_u_norm, mse_train_u_tlift):>13.2f}%"
-    )
-    print(
-        f"{'Testing forcing':25s} "
-        f"{mse_test_F_norm:>15.4e} {mse_test_F_tlift:>16.4e} "
-        f"{pct_imp(mse_test_F_norm, mse_test_F_tlift):>13.2f}%"
-    )
-    print(
-        f"{'Testing solution':25s} "
-        f"{mse_test_u_norm:>15.4e} {mse_test_u_tlift:>16.4e} "
-        f"{pct_imp(mse_test_u_norm, mse_test_u_tlift):>13.2f}%"
-    )
 
 
 
@@ -1019,83 +722,562 @@ def rolling_online_predict(state: dict,
     }
 
 
-
 def solve_signature_kernel_rolling_retrain(
     t_train: torch.Tensor,
-    t_test: torch.Tensor,
+    t_test:  torch.Tensor,
     f_train: torch.Tensor,
-    f_test: torch.Tensor,
+    f_test:  torch.Tensor,
     k1, k2, k3,
     ua, upa,
-    depth, normalize = True, reg = 1e-10,
+    depth, normalize=True, reg=1e-10,
     retrain_every: int = 10,
 ):
     """
     Non-branched testing with periodic retraining.
     """
-
     u_pred_full = []
     f_pred_full = []
 
-
     with torch.no_grad():
-        #Train first
-        X_train = torch.stack([t_train, f_train], dim=1)           # (T,2)
-        X_sig_train = compute_signatures(X_train, depth)     # (T,D)
-        if(normalize == True):
-            X_sig_train = normalize_signatures(Z=X_sig_train,depth=depth,dim=X_train.shape[1],)
+        X_train     = torch.stack([t_train, f_train], dim=1)
+        X_sig_train = compute_signatures(X_train, depth)
+        if normalize:
+            X_sig_train = normalize_signatures(Z=X_sig_train, depth=depth, dim=X_train.shape[1])
         Ksig_train = build_kernel_from_signatures(X_sig_train)
-        beta_w, u_pred_train, f_pred_train, rhs_true_train = solvebetas(Ksig=Ksig_train,f=f_train,x=t_train,ua=ua, upa=upa,k1=k1,k2=k2,k3=k3,reg = reg)
+        beta_w, u_pred_train, f_pred_train, rhs_true_train = solvebetas(
+            Ksig=Ksig_train, f=f_train, x=t_train,
+            ua=ua, upa=upa, k1=k1, k2=k2, k3=k3, reg=reg)
         u_pred_full = u_pred_train.clone()
         f_pred_full = f_pred_train.clone()
-        print(
-            f"initial train integrated-target loss: "
-            f"{forcing_loss(rhs_true_train, f_pred_train).item():.3e}"
-        )
+        print(f"initial train integrated-target loss: "
+              f"{forcing_loss(rhs_true_train, f_pred_train).item():.3e}")
 
-        print("George please implement the rest. keep the function parameter/signature the same and return the same. try to use the functions i used except for you rolling retrain")
+        N_train = t_train.numel()
+        N_test  = t_test.numel()
 
+        for j in range(1, N_test + 1):
+            t_curr = torch.cat([t_train, t_test[:j]], dim=0)
+            f_curr = torch.cat([f_train, f_test[:j]], dim=0)
 
+            if (j % retrain_every) == 0:
+                X_train     = torch.stack([t_curr, f_curr], dim=1)
+                X_sig_train = compute_signatures(X_train, depth)
+                if normalize:
+                    X_sig_train = normalize_signatures(Z=X_sig_train, depth=depth, dim=X_train.shape[1])
+                Ksig_train  = build_kernel_from_signatures(X_sig_train)
+                beta_w, u_pred_train, f_pred_train, rhs_true_train = solvebetas(
+                    Ksig=Ksig_train, f=f_curr, x=t_curr,
+                    ua=ua, upa=upa, k1=k1, k2=k2, k3=k3, reg=reg)
+                u_pred_full = torch.cat([u_pred_full, u_pred_train[-1:]], dim=0)
+                f_pred_full = torch.cat([f_pred_full, f_pred_train[-1:]], dim=0)
+                continue
+
+            X_curr    = torch.stack([t_curr, f_curr], dim=1)
+            X_sig_cur = compute_signatures(X_curr, depth)
+            if normalize:
+                _, X_sig_cur = apply_signature_normalization_pair(
+                    X_sig_train, X_sig_cur, depth=depth, dim=X_curr.shape[1])
+
+            dt = (t_curr[-1] - t_curr[-2]).item()
+
+            phi_K0_row = build_kernel_from_different_signatures(
+                X_sig_cur[-1:], X_sig_cur[:-1]).squeeze(0)
+            k_diag     = torch.dot(X_sig_cur[-1], X_sig_cur[-1])
+
+            K_col  = torch.cat([phi_K0_row, k_diag.unsqueeze(0)], dim=0)
+            I1_col = trapezoidal_cols(K_col.unsqueeze(1), dt).squeeze(1)
+            I2_col = trapezoidal_cols(I1_col.unsqueeze(1), dt).squeeze(1)
+
+            phi_row_old = k1 * phi_K0_row + k2 * I1_col[:-1] + k3 * I2_col[:-1]
+            phi_diag    = k1 * k_diag.item() + k2 * float(I1_col[-1]) + k3 * float(I2_col[-1])
+
+            alpha_new = (f_test[j-1] - torch.dot(phi_row_old, beta_w)) / (phi_diag + 1e-12)
+            alphas    = torch.cat([beta_w, alpha_new.unsqueeze(0)], dim=0)
+
+            Ksig_full      = build_kernel_from_signatures(X_sig_cur)
+            K0, I1K, I2K   = buildkerneloperators(Ksig_full, t_curr)
+            u_all, Iu, I2u = evaluate_solution_from_beta(K0, I1K, I2K, t_curr, alphas, ua, upa)
+            f_pred_all     = evaluate_forcing_from_solution(u_all, Iu, I2u, k1, k2, k3)
+
+            u_pred_full = torch.cat([u_pred_full, u_all[-1:]], dim=0)
+            f_pred_full = torch.cat([f_pred_full, f_pred_all[-1:]], dim=0)
+
+    t_all      = torch.cat([t_train, t_test], dim=0)
+    f_all      = torch.cat([f_train, f_test], dim=0)
+    final_loss = forcing_loss(f_all, f_pred_full)
+    print(f"final forcing loss (train+test, last beta): {final_loss.item():.3e}")
     return u_pred_full, f_pred_full
 
 
 def solve_signature_kernel_rolling_retrain_tlift(
     t_train: torch.Tensor,
-    t_test: torch.Tensor,
+    t_test:  torch.Tensor,
     f_train: torch.Tensor,
-    f_test: torch.Tensor,
+    f_test:  torch.Tensor,
     k1, k2, k3,
     ua, upa,
-    depth, normalize = True, 
-    t_lift_value = .5,
-    reg = 1e-10,
+    depth, normalize=True, tlift_value=0.5, reg=1e-10,
     retrain_every: int = 10,
 ):
     """
-    Non-branched testing with periodic retraining.
+    Non-branched testing with periodic retraining + Hölder time-lift.
+    Identical to solve_signature_kernel_rolling_retrain but every path
+    tensor is passed through tlift(...) before computing signatures.
     """
-
     u_pred_full = []
     f_pred_full = []
 
-
     with torch.no_grad():
-        #Train first
-        X_train = torch.stack([t_train, f_train], dim=1)           # (T,2)
-        X_train = tlift(X_train, t_lift_value)
-        X_sig_train = compute_signatures(X_train, depth)     # (T,D)
-        if(normalize == True):
-            X_sig_train = normalize_signatures(Z=X_sig_train,depth=depth,dim=X_train.shape[1],)
+        X_train     = tlift(torch.stack([t_train, f_train], dim=1), tlift_value)
+        X_sig_train = compute_signatures(X_train, depth)
+        if normalize:
+            X_sig_train = normalize_signatures(Z=X_sig_train, depth=depth, dim=X_train.shape[1])
         Ksig_train = build_kernel_from_signatures(X_sig_train)
-        beta_w, u_pred_train, f_pred_train, rhs_true_train = solvebetas(Ksig=Ksig_train,f=f_train,x=t_train,ua=ua, upa=upa,k1=k1,k2=k2,k3=k3,reg = reg)
+        beta_w, u_pred_train, f_pred_train, rhs_true_train = solvebetas(
+            Ksig=Ksig_train, f=f_train, x=t_train,
+            ua=ua, upa=upa, k1=k1, k2=k2, k3=k3, reg=reg)
         u_pred_full = u_pred_train.clone()
         f_pred_full = f_pred_train.clone()
+        print(f"initial train integrated-target loss: "
+              f"{forcing_loss(rhs_true_train, f_pred_train).item():.3e}")
+
+        N_train = t_train.numel()
+        N_test  = t_test.numel()
+
+        for j in range(1, N_test + 1):
+            t_curr = torch.cat([t_train, t_test[:j]], dim=0)
+            f_curr = torch.cat([f_train, f_test[:j]], dim=0)
+
+            if (j % retrain_every) == 0:
+                X_train     = tlift(torch.stack([t_curr, f_curr], dim=1), tlift_value)
+                X_sig_train = compute_signatures(X_train, depth)
+                if normalize:
+                    X_sig_train = normalize_signatures(Z=X_sig_train, depth=depth, dim=X_train.shape[1])
+                Ksig_train  = build_kernel_from_signatures(X_sig_train)
+                beta_w, u_pred_train, f_pred_train, rhs_true_train = solvebetas(
+                    Ksig=Ksig_train, f=f_curr, x=t_curr,
+                    ua=ua, upa=upa, k1=k1, k2=k2, k3=k3, reg=reg)
+                u_pred_full = torch.cat([u_pred_full, u_pred_train[-1:]], dim=0)
+                f_pred_full = torch.cat([f_pred_full, f_pred_train[-1:]], dim=0)
+                continue
+
+            X_curr    = tlift(torch.stack([t_curr, f_curr], dim=1), tlift_value)
+            X_sig_cur = compute_signatures(X_curr, depth)
+            if normalize:
+                _, X_sig_cur = apply_signature_normalization_pair(
+                    X_sig_train, X_sig_cur, depth=depth, dim=X_curr.shape[1])
+
+            dt = (t_curr[-1] - t_curr[-2]).item()
+
+            phi_K0_row = build_kernel_from_different_signatures(
+                X_sig_cur[-1:], X_sig_cur[:-1]).squeeze(0)
+            k_diag     = torch.dot(X_sig_cur[-1], X_sig_cur[-1])
+
+            K_col  = torch.cat([phi_K0_row, k_diag.unsqueeze(0)], dim=0)
+            I1_col = trapezoidal_cols(K_col.unsqueeze(1), dt).squeeze(1)
+            I2_col = trapezoidal_cols(I1_col.unsqueeze(1), dt).squeeze(1)
+
+            phi_row_old = k1 * phi_K0_row + k2 * I1_col[:-1] + k3 * I2_col[:-1]
+            phi_diag    = k1 * k_diag.item() + k2 * float(I1_col[-1]) + k3 * float(I2_col[-1])
+
+            alpha_new = (f_test[j-1] - torch.dot(phi_row_old, beta_w)) / (phi_diag + 1e-12)
+            alphas    = torch.cat([beta_w, alpha_new.unsqueeze(0)], dim=0)
+
+            Ksig_full      = build_kernel_from_signatures(X_sig_cur)
+            K0, I1K, I2K   = buildkerneloperators(Ksig_full, t_curr)
+            u_all, Iu, I2u = evaluate_solution_from_beta(K0, I1K, I2K, t_curr, alphas, ua, upa)
+            f_pred_all     = evaluate_forcing_from_solution(u_all, Iu, I2u, k1, k2, k3)
+
+            u_pred_full = torch.cat([u_pred_full, u_all[-1:]], dim=0)
+            f_pred_full = torch.cat([f_pred_full, f_pred_all[-1:]], dim=0)
+
+    t_all      = torch.cat([t_train, t_test], dim=0)
+    f_all      = torch.cat([f_train, f_test], dim=0)
+    final_loss = forcing_loss(f_all, f_pred_full)
+    print(f"final forcing loss (train+test, last beta): {final_loss.item():.3e}")
+    return u_pred_full, f_pred_full
+#Error printing and plotting functions
+
+def mse(pred, true):
+    pred = pred.to(true.device)
+    return torch.mean((pred - true) ** 2).item()
+
+def rel_mse(pred, true):
+    pred = pred.to(true.device)
+    return torch.mean((pred - true) ** 2).item() / torch.mean(true ** 2).item()
+
+
+
+def print_errors_calibration(F_pred, F_star, U_pred, U_true):
+    # Ensure predictions on same device as references
+    F_pred = F_pred.to(F_star.device)
+    U_pred = U_pred.to(U_true.device)
+
+    # Forcing errors
+    abs_mse_F = mse(F_pred, F_star)
+    rel_mse_F = rel_mse(F_pred, F_star)
+
+    # Solution errors
+    abs_mse_u = mse(U_pred, U_true)
+    rel_mse_u = rel_mse(U_pred, U_true)
+
+    print("\n==============================")
+    print("Model Error Summary")
+    print("==============================")
+    print(f"{'Quantity':20s} {'Absolute MSE':>18s} {'Relative MSE':>18s} {'Relative MSE (%)':>20s}")
+    print("-" * 80)
+    print(f"{'Forcing F*':20s} {abs_mse_F:>18.6e} {rel_mse_F:>18.6e} {100 * rel_mse_F:>19.4f}%")
+    print(f"{'Solution u(t)':20s} {abs_mse_u:>18.6e} {rel_mse_u:>18.6e} {100 * rel_mse_u:>19.4f}%")
+
+def plot_calibration(time, F_star, F_hat, U_true, U_hat):
+    """
+    Plot calibration results.
+
+    Parameters
+    ----------
+    time   : array-like  (T,)  — time grid
+    F_star : tensor/array (T,) — reference double-integrated forcing
+    F_hat  : tensor/array (T,) — model-predicted double-integrated forcing
+    U_true : tensor/array (T,) — reference solution u(t)
+    U_hat  : tensor/array (T,) — reconstructed solution u(t)
+    """
+    # Convert tensors to plain lists for matplotlib
+    def _to_list(x):
+        if isinstance(x, torch.Tensor):
+            return x.detach().cpu().tolist()
+        return list(x)
+
+    time_list   = _to_list(time)
+    F_star_list = _to_list(F_star)
+    F_hat_list  = _to_list(F_hat)
+    U_true_list = _to_list(U_true)
+    U_hat_list  = _to_list(U_hat)        # ← was incorrectly K_A
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+    # Left: Forcing
+    axes[0].plot(time_list, F_star_list,
+                 color="black", linewidth=1.5, label="Reference Forcing")
+    axes[0].plot(time_list, F_hat_list,
+                 color="blue", linestyle="--", linewidth=1.5, label="Calibrated Forcing")
+    axes[0].set_title("Double Integral Forcing Fit")
+    axes[0].set_xlabel("t")
+    axes[0].set_ylabel("$\\iint f(t)$")
+    axes[0].legend(frameon=True, fancybox=False, edgecolor="black")
+    axes[0].grid(True, alpha=0.3)
+
+    # Right: Solution
+    axes[1].plot(time_list, U_true_list,
+                 color="black", linewidth=1.5, label="Reference $u(t)$")
+    axes[1].plot(time_list, U_hat_list,          # ← fixed: was K_A
+                 color="blue", linestyle="--", linewidth=1.5, label="Reconstructed $u(t)$")
+    axes[1].set_title("Solution Reconstruction")
+    axes[1].set_xlabel("t")
+    axes[1].set_ylabel("$u(t)$")
+    axes[1].legend(frameon=True, fancybox=False, edgecolor="black")
+    axes[1].grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    plt.show()
+
+
+
+def plot_normal_vs_tlift(
+    t_vals: torch.Tensor,
+    TRAIN_FRAC: float,
+    u_pred_full: torch.Tensor,
+    f_pred_full: torch.Tensor,
+    u_pred_full_tlift: torch.Tensor,
+    f_pred_full_tlift: torch.Tensor,
+    U_ref: torch.Tensor,
+    F_star: torch.Tensor,
+):
+    """
+    2x2 plot: forcing and solution, normal vs t-lift,
+    with a vertical line at the train/test split.
+    """
+    # Indices and split
+    N        = t_vals.numel()
+    N_train  = int(N * TRAIN_FRAC)
+    idx_train = torch.arange(0, N_train)
+    idx_test  = torch.arange(N_train, N)
+
+    t_train = t_vals[idx_train]
+    t_test  = t_vals[idx_test]
+    t_split = float(t_vals[N_train - 1].item())
+
+    # Convert to lists for matplotlib
+    def _tolist(x):
+        if isinstance(x, torch.Tensor):
+            return x.detach().cpu().tolist()
+        return list(x)
+
+    t_train_l = _tolist(t_train)
+    t_test_l  = _tolist(t_test)
+
+    F_star_train_l = _tolist(F_star[idx_train])
+    F_star_test_l  = _tolist(F_star[idx_test])
+
+    f_norm_train_l = _tolist(f_pred_full[idx_train])
+    f_norm_test_l  = _tolist(f_pred_full[idx_test])
+
+    f_tlift_train_l = _tolist(f_pred_full_tlift[idx_train])
+    f_tlift_test_l  = _tolist(f_pred_full_tlift[idx_test])
+
+    u_ref_train_l = _tolist(U_ref[idx_train])
+    u_ref_test_l  = _tolist(U_ref[idx_test])
+
+    u_norm_train_l = _tolist(u_pred_full[idx_train])
+    u_norm_test_l  = _tolist(u_pred_full[idx_test])
+
+    u_tlift_train_l = _tolist(u_pred_full_tlift[idx_train])
+    u_tlift_test_l  = _tolist(u_pred_full_tlift[idx_test])
+
+    # Plot style (reuse style from other helpers)
+    plt.rcParams.update({
+        "font.family": "serif",
+        "font.size": 13,
+        "axes.labelsize": 15,
+        "axes.titlesize": 16,
+        "legend.fontsize": 12,
+        "xtick.labelsize": 12,
+        "ytick.labelsize": 12,
+        "axes.linewidth": 1.1,
+        "figure.dpi": 150,
+        "savefig.dpi": 300,
+        "savefig.bbox": "tight",
+    })
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+
+    # --- Top-left: Forcing, normal ---
+    ax = axes[0, 0]
+    ax.plot(t_train_l, F_star_train_l,
+            color="black", linewidth=1.5, label="True F*")
+    ax.plot(t_train_l, f_norm_train_l,
+            color="red", linestyle="--", linewidth=1.5)
+    ax.plot(t_test_l,  F_star_test_l,
+            color="black", linewidth=1.5)
+    ax.plot(t_test_l,  f_norm_test_l,
+            color="red", linestyle="--", linewidth=1.5,
+            label="normal pred F*")
+    ax.axvline(x=t_split, color="gray", linestyle=":", linewidth=1.4,
+               label="Train/test split")
+    ax.set_title("Forcing: normal vs true")
+    ax.set_xlabel("t")
+    ax.set_ylabel("F*(t)")
+    ax.legend(frameon=True, fancybox=False, edgecolor="black")
+
+    # --- Top-right: Forcing, t-lift ---
+    ax = axes[0, 1]
+    ax.plot(t_train_l, F_star_train_l,
+            color="black", linewidth=1.5, label="True F*")
+    ax.plot(t_train_l, f_tlift_train_l,
+            color="blue", linestyle="--", linewidth=1.5)
+    ax.plot(t_test_l,  F_star_test_l,
+            color="black", linewidth=1.5)
+    ax.plot(t_test_l,  f_tlift_test_l,
+            color="blue", linestyle="--", linewidth=1.5,
+            label="t-lift pred F*")
+    ax.axvline(x=t_split, color="gray", linestyle=":", linewidth=1.4,
+               label="Train/test split")
+    ax.set_title("Forcing: t-lift vs true")
+    ax.set_xlabel("t")
+    ax.set_ylabel("F*(t)")
+    ax.legend(frameon=True, fancybox=False, edgecolor="black")
+
+    # --- Bottom-left: Solution, normal ---
+    ax = axes[1, 0]
+    ax.plot(t_train_l, u_ref_train_l,
+            color="black", linewidth=1.5, label="reference u(t)")
+    ax.plot(t_train_l, u_norm_train_l,
+            color="red", linestyle="--", linewidth=1.5)
+    ax.plot(t_test_l,  u_ref_test_l,
+            color="black", linewidth=1.5)
+    ax.plot(t_test_l,  u_norm_test_l,
+            color="red", linestyle="--", linewidth=1.5,
+            label="normal pred u(t)")
+    ax.axvline(x=t_split, color="gray", linestyle=":", linewidth=1.2,
+               label="Train/test split")
+    ax.set_title("Solution: normal vs reference")
+    ax.set_xlabel("t")
+    ax.set_ylabel("u(t)")
+    ax.legend(frameon=True, fancybox=False, edgecolor="black")
+
+    # --- Bottom-right: Solution, t-lift ---
+    ax = axes[1, 1]
+    ax.plot(t_train_l, u_ref_train_l,
+            color="black", linewidth=1.5, label="reference u(t)")
+    ax.plot(t_train_l, u_tlift_train_l,
+            color="blue", linestyle="--", linewidth=1.5)
+    ax.plot(t_test_l,  u_ref_test_l,
+            color="black", linewidth=1.5)
+    ax.plot(t_test_l,  u_tlift_test_l,
+            color="blue", linestyle="--", linewidth=1.5,
+            label="t-lift pred u(t)")
+    ax.axvline(x=t_split, color="gray", linestyle=":", linewidth=1.2,
+               label="Train/test split")
+    ax.set_title("Solution: t-lift vs reference")
+    ax.set_xlabel("t")
+    ax.set_ylabel("u(t)")
+    ax.legend(frameon=True, fancybox=False, edgecolor="black")
+
+    fig.tight_layout()
+    plt.show()
+
+
+def print_normal_vs_tlift(
+    t_vals: torch.Tensor,
+    TRAIN_FRAC: float,
+    u_pred_full: torch.Tensor,
+    f_pred_full: torch.Tensor,
+    u_pred_full_tlift: torch.Tensor,
+    f_pred_full_tlift: torch.Tensor,
+    U_ref: torch.Tensor,
+    F_star: torch.Tensor,
+):
+    N        = t_vals.numel()
+    N_train  = int(N * TRAIN_FRAC)
+    idx_train = torch.arange(0, N_train)
+    idx_test  = torch.arange(N_train, N)
+    idx_all   = torch.arange(0, N)
+
+    def rel_mse(pred, true):
+        pred = pred.to(true.device)
+        return torch.mean((pred - true) ** 2).item() / torch.mean(true ** 2).item()
+
+    def pct_imp(nb, b):
+        return (nb - b) / abs(nb) * 100 if nb != 0 else float("nan")
+
+    rows = [
+        ("Training forcing",   idx_train, f_pred_full, f_pred_full_tlift, F_star),
+        ("Training solution",  idx_train, u_pred_full, u_pred_full_tlift, U_ref),
+        ("Testing forcing",    idx_test,  f_pred_full, f_pred_full_tlift, F_star),
+        ("Testing solution",   idx_test,  u_pred_full, u_pred_full_tlift, U_ref),
+        ("Train+Test forcing", idx_all,   f_pred_full, f_pred_full_tlift, F_star),
+        ("Train+Test solution",idx_all,   u_pred_full, u_pred_full_tlift, U_ref),
+    ]
+
+    print(f"\n{'':25s} {'Normal':>15} {'t-lift':>16} {'% Improvement':>14}")
+    print("-" * 72)
+    prev_section = "Training"
+    for label, idx, pred_norm, pred_tlift, ref in rows:
+        # Print separator between train/test/full sections
+        section = label.split()[0]
+        if section != prev_section:
+            print("-" * 72)
+            prev_section = section
+
+        norm  = rel_mse(pred_norm[idx],  ref[idx])
+        tlift = rel_mse(pred_tlift[idx], ref[idx])
         print(
-            f"initial train integrated-target loss: "
-            f"{forcing_loss(rhs_true_train, f_pred_train).item():.3e}"
+            f"{label:25s} "
+            f"{norm:>15.4e} {tlift:>16.4e} "
+            f"{pct_imp(norm, tlift):>13.2f}%"
         )
 
-        
-        print("George please implement the rest. keep the function parameter/signature the same and return the same. try to use the functions i used except for you rolling retrain")
 
-    return u_pred_full, f_pred_full
+
+## Compare: Predict-Retrain vs Rolling Retrain
+
+def rel_mse(pred, true):
+    pred = pred.to(true.device)
+    return (torch.mean((pred - true) ** 2) / torch.mean(true ** 2)).item()
+
+
+def print_method_comparison(t_vals, TRAIN_FRAC,
+                             f_pred_full, u_pred_full,
+                             f_pred_full_tlift, u_pred_full_tlift,
+                             f_pred_full_rolling, u_pred_full_rolling,
+                             f_pred_full_tlift_rolling, u_pred_full_tlift_rolling,
+                             F_star, U_ref):
+    N_train  = int(len(t_vals) * TRAIN_FRAC)
+    idx_all   = torch.arange(0, len(t_vals))
+    idx_train = torch.arange(0, N_train)
+    idx_test  = torch.arange(N_train, len(t_vals))
+
+    methods = [
+        ("Predict-Retrain (normal)",    f_pred_full,               u_pred_full),
+        ("Predict-Retrain (t-lift)",    f_pred_full_tlift,         u_pred_full_tlift),
+        ("Rolling-Retrain (normal)",    f_pred_full_rolling,       u_pred_full_rolling),
+        ("Rolling-Retrain (t-lift)",    f_pred_full_tlift_rolling, u_pred_full_tlift_rolling),
+    ]
+
+    header = f"{'Method':<35} {'Split':<8} {'Forcing Rel MSE':>16} {'Solution Rel MSE':>18}"
+    print("=" * len(header))
+    print(header)
+
+    prev = None
+    for label, f_pred, u_pred in methods:
+        print("-" * len(header))
+        for split_name, idx in [("Train", idx_train), ("Test", idx_test), ("All", idx_all)]:
+            f_err = rel_mse(f_pred[idx], F_star[idx])
+            u_err = rel_mse(u_pred[idx], U_ref[idx])
+            row_label = label if split_name == "Train" else ""
+            print(f"{row_label:<35} {split_name:<8} {f_err:>16.4e} {u_err:>18.4e}")
+
+    print("=" * len(header))
+
+
+def plot_method_comparison(t_vals, TRAIN_FRAC,
+                           f_pred_full, u_pred_full,
+                           f_pred_full_tlift, u_pred_full_tlift,
+                           f_pred_full_rolling, u_pred_full_rolling,
+                           f_pred_full_tlift_rolling, u_pred_full_tlift_rolling,
+                           F_star, U_ref):
+    N       = len(t_vals)
+    N_train = int(N * TRAIN_FRAC)
+    t_split = float(t_vals[N_train - 1].item())
+
+    def to_list(x):
+        return x.detach().cpu().tolist() if isinstance(x, torch.Tensor) else list(x)
+
+    t_list  = to_list(t_vals)
+    fs_list = to_list(F_star)
+    ur_list = to_list(U_ref)
+
+    methods = [
+        ("Predict-Retrain\n(normal)",  f_pred_full,               u_pred_full),
+        ("Predict-Retrain\n(t-lift)",  f_pred_full_tlift,         u_pred_full_tlift),
+        ("Rolling-Retrain\n(normal)",  f_pred_full_rolling,       u_pred_full_rolling),
+        ("Rolling-Retrain\n(t-lift)",  f_pred_full_tlift_rolling, u_pred_full_tlift_rolling),
+    ]
+
+    plt.rcParams.update({
+        "font.family": "serif", "font.size": 11,
+        "axes.labelsize": 12, "axes.titlesize": 12,
+        "legend.fontsize": 9,  "figure.dpi": 130,
+    })
+
+    fig, axes = plt.subplots(2, 4, figsize=(18, 8), sharey="row")
+
+    for col, (label, f_pred, u_pred) in enumerate(methods):
+        f_list = to_list(f_pred)
+        u_list = to_list(u_pred)
+
+        # --- Row 0: Forcing ---
+        ax = axes[0, col]
+        ax.plot(t_list, fs_list, color="black",  linewidth=1.2, label="Reference")
+        ax.plot(t_list, f_list,  color="tab:blue", linewidth=1.0, linestyle="--", label="Predicted")
+        ax.axvline(t_split, color="gray", linestyle=":", linewidth=1.0)
+        ax.set_title(label)
+        ax.set_xlabel("t")
+        if col == 0:
+            ax.set_ylabel("F(t)")
+            ax.legend(frameon=True, fancybox=False, edgecolor="black")
+
+        # --- Row 1: Solution ---
+        ax = axes[1, col]
+        ax.plot(t_list, ur_list, color="black",   linewidth=1.2, label="Reference")
+        ax.plot(t_list, u_list,  color="tab:red",  linewidth=1.0, linestyle="--", label="Predicted")
+        ax.axvline(t_split, color="gray", linestyle=":", linewidth=1.0, label="Train/test split")
+        ax.set_xlabel("t")
+        if col == 0:
+            ax.set_ylabel("u(t)")
+            ax.legend(frameon=True, fancybox=False, edgecolor="black")
+
+    fig.suptitle("Method Comparison — Forcing (top) and Solution (bottom)", fontsize=13, y=1.01)
+    fig.tight_layout()
+    plt.show()
+
+
