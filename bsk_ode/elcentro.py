@@ -101,6 +101,22 @@ def build_kernel_from_signatures(sigs_flat: torch.Tensor) -> torch.Tensor:
     Ker = sigs_flat @ sigs_flat.T
     return Ker
 
+
+def build_kernel_from_different_signatures(
+    sigs_flat1: torch.Tensor,
+    sigs_flat2: torch.Tensor
+    ) -> torch.Tensor:
+    """
+    Build a cross-kernel matrix from two sets of signature features.
+
+    sigs_flat1: (T1, D)
+    sigs_flat2: (T2, D)
+    Returns:
+        Ker: (T1, T2)
+    """
+    Ker = sigs_flat1 @ sigs_flat2.T
+    return Ker
+
 def normalize_signatures(Z: torch.Tensor,
                              depth: int,
                              dim: int,
@@ -120,6 +136,36 @@ def normalize_signatures(Z: torch.Tensor,
     iqr = q75 - q25
     return (Z - med) / (iqr + eps)
 
+def apply_signature_normalization_pair(
+    sigs_train: torch.Tensor,
+    sigs_full: torch.Tensor,
+    depth: int,
+    dim: int,
+    **kwargs
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Normalize both train and full signatures using training statistics only.
+    Uses the same median/IQR scheme as normalize_signatures, but
+    estimates med/iqr on sigs_train and applies them to both.
+
+    Returns:
+        (sigs_train_norm, sigs_full_norm)
+    """
+    eps = kwargs.get("eps", 1e-8)
+
+    # Compute robust column-wise stats on the *training* signatures
+    med = sigs_train.median(dim=0, keepdim=True).values
+    q25 = sigs_train.quantile(0.25, dim=0, keepdim=True)
+    q75 = sigs_train.quantile(0.75, dim=0, keepdim=True)
+    iqr = q75 - q25
+
+    sigs_train_norm = (sigs_train - med) / (iqr + eps)
+    sigs_full_norm  = (sigs_full  - med) / (iqr + eps)
+
+    return sigs_train_norm, sigs_full_norm
+ 
+
+
 def buildkerneloperators(Ksig: torch.Tensor, x: torch.Tensor):
     dtype = Ksig.dtype
     device = Ksig.device
@@ -131,6 +177,8 @@ def buildkerneloperators(Ksig: torch.Tensor, x: torch.Tensor):
     I2 = cumulative_trapezoid(I1, x, dim=0)
     I2 = torch.vstack([torch.zeros_like(I2[:1]), I2])  # I^2 K
     return K0, I1, I2
+
+
 
 def double_integrate(y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     return cumtrapz_torch(cumtrapz_torch(y, x), x)
@@ -174,6 +222,43 @@ def solvebetas(Ksig: torch.Tensor,
 
     return beta, u, rhs_pred, rhs
 
+def evaluate_solution_from_beta(
+    K0: torch.Tensor,
+    IK: torch.Tensor,
+    I2K: torch.Tensor,
+    x: torch.Tensor,
+    beta: torch.Tensor,
+    ua: float,
+    upa: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Given kernel operators K0, IK, I2K and coefficients beta,
+    reconstruct u, Iu, I^2 u on the grid x for method 2.
+    """
+
+    u   = K0  @ beta   # u      ~ K0  beta  (same as in solvebetasmethod2)
+    Iu  = IK  @ beta   # ∫u     ~ IK  beta
+    I2u = I2K @ beta   # ∫∫u    ~ I2K beta
+
+    # Maintain the output order expected by the test code:
+    return u, Iu, I2u
+
+
+def evaluate_forcing_from_solution(
+    u: torch.Tensor,      # really u
+    Iu: torch.Tensor,     # ∫u
+    I2u: torch.Tensor,    # ∫∫u
+    k1: float,
+    k2: float,
+    k3: float,
+) -> torch.Tensor:
+    """
+    Method 2 integrated target:
+        rhs_pred(x) = k1 * u(x) + k2 * ∫u + k3 * ∫∫u.
+    """
+    return k1 * u + k2 * Iu + k3 * I2u
+
+
 
 def solve_signature_kernel(x, f,
                         k1, k2, k3,
@@ -185,27 +270,15 @@ def solve_signature_kernel(x, f,
     with torch.no_grad():
 
         X = torch.stack([x, f], dim=1)           # (T,2)
-
         X_sig = compute_signatures(X, depth)     # (T,D)
-
         if(normalize == True):
-            X_sig = normalize_signatures(
-                Z=X_sig,
-                depth=depth,
-                dim=X.shape[1],
-            )
-
+            X_sig = normalize_signatures(Z=X_sig,depth=depth,dim=X.shape[1],)
         Ksig = build_kernel_from_signatures(X_sig)
-
         beta_w, u, f_pred_final, rhs_true = solvebetas(
             Ksig=Ksig,
-            f=f,
-            x=x,
-            ua=ua,
-            upa=upa,
-            k1=k1,
-            k2=k2,
-            k3=k3,
+            f=f,x=x,
+            ua=ua, upa=upa,
+            k1=k1,k2=k2,k3=k3,
             reg = reg
         )
 
@@ -213,6 +286,199 @@ def solve_signature_kernel(x, f,
         print(f"non-branched integrated-target loss: {final_loss.item():.3e}")
 
     return u, f_pred_final
+
+
+
+def solve_signature_kernel_predict_retrain(
+    t_train: torch.Tensor,
+    t_test: torch.Tensor,
+    f_train: torch.Tensor,
+    f_test: torch.Tensor,
+    k1, k2, k3,
+    ua, upa,
+    depth, normalize = True, reg = 1e-10,
+    retrain_every: int = 10,
+):
+    """
+    Non-branched testing with periodic retraining.
+    """
+
+    u_pred_full = []
+    f_pred_full = []
+
+
+    with torch.no_grad():
+        #Train first
+        X_train = torch.stack([t_train, f_train], dim=1)           # (T,2)
+        X_sig_train = compute_signatures(X_train, depth)     # (T,D)
+        if(normalize == True):
+            X_sig_train = normalize_signatures(Z=X_sig_train,depth=depth,dim=X_train.shape[1],)
+        Ksig_train = build_kernel_from_signatures(X_sig_train)
+        beta_w, u_pred_train, f_pred_train, rhs_true_train = solvebetas(Ksig=Ksig_train,f=f_train,x=t_train,ua=ua, upa=upa,k1=k1,k2=k2,k3=k3,reg = reg)
+        u_pred_full = u_pred_train.clone()
+        f_pred_full = f_pred_train.clone()
+        print(
+            f"initial train integrated-target loss: "
+            f"{forcing_loss(rhs_true_train, f_pred_train).item():.3e}"
+        )
+
+        # Loop over test points; at step j we evaluate on [train | first j test]
+        N_train = t_train.numel()
+        N_test = t_test.numel()
+        for j in range(1, N_test + 1):
+            #Retrain if at retraining step
+            if (j % retrain_every) == 0:
+                t_retrain = torch.cat([t_train, t_test[:j]], dim=0)
+                f_retrain = torch.cat([f_train, f_test[:j]], dim=0)
+                X_train = torch.stack([t_retrain, f_retrain], dim=1)  # (T,2)
+                X_sig_train = compute_signatures(X_train, depth)     # (T,D)
+                if(normalize == True):
+                    X_sig_train = normalize_signatures(Z=X_sig_train,depth=depth,dim=X_train.shape[1],)
+                Ksig_train = build_kernel_from_signatures(X_sig_train)
+                beta_w, u_pred_train, f_pred_train, rhs_true_train = solvebetas(Ksig=Ksig_train,f=f_retrain,x=t_retrain,ua=ua, upa=upa,k1=k1,k2=k2,k3=k3,reg = reg)
+
+            #Build new training path by adding new points onto current training path
+            x_curr = torch.cat([t_train, t_test[:j]], dim=0)
+            f_curr = torch.cat([f_train, f_test[:j]], dim=0)
+            X_curr = torch.stack([x_curr, f_curr], dim=1)
+
+            #Compute Signatures of new path and normalize
+            X_sig_curr = compute_signatures(X_curr, depth)
+            if(normalize == True):
+                _, X_sig_curr = apply_signature_normalization_pair(X_sig_train, X_sig_curr, depth=depth, dim=X_train.shape[1],)
+
+            #Build Kernels and Operatprs
+            Ksig_curr_train = build_kernel_from_different_signatures(X_sig_curr, X_sig_train)
+            Ku2_curr, Kup_curr, Ku_curr = buildkerneloperators(Ksig_curr_train, x_curr)
+
+            # Evaluate on current grid
+            u_curr, u_p_curr, u_dd_curr = evaluate_solution_from_beta(Ku2_curr, Kup_curr, Ku_curr, x_curr, beta_w, ua, upa)
+            f_curr_pred = evaluate_forcing_from_solution(u_curr, u_p_curr, u_dd_curr, k1, k2, k3)
+
+            # append only the new test part onto the end of the tensors
+            u_pred_full = torch.cat([u_pred_full, u_curr[N_train + j - 1:N_train + j]], dim=0)
+            f_pred_full = torch.cat([f_pred_full, f_curr_pred[N_train + j - 1:N_train + j]], dim=0)
+
+    #Testing done, print accuracy of forcing
+    t_all = torch.cat([t_train, t_test], dim=0)
+    f_all = torch.cat([f_train, f_test], dim=0)
+    final_loss = forcing_loss(f_all, f_pred_full)
+    print(f"final forcing loss (train+test, last beta): {final_loss.item():.3e}")
+
+    return u_pred_full, f_pred_full
+
+
+def solve_signature_kernel_predict_retrain_tlift(
+    t_train: torch.Tensor,
+    t_test: torch.Tensor,
+    f_train: torch.Tensor,
+    f_test: torch.Tensor,
+    k1, k2, k3,
+    ua, upa,
+    depth, normalize = True, 
+    t_lift_value = .5,
+    reg = 1e-10,
+    retrain_every: int = 10,
+):
+    """
+    Non-branched testing with periodic retraining.
+    """
+
+    u_pred_full = []
+    f_pred_full = []
+
+
+    with torch.no_grad():
+        #Train first
+        X_train = torch.stack([t_train, f_train], dim=1)           # (T,2)
+        X_train = tlift(X_train, t_lift_value)
+        X_sig_train = compute_signatures(X_train, depth)     # (T,D)
+        if(normalize == True):
+            X_sig_train = normalize_signatures(Z=X_sig_train,depth=depth,dim=X_train.shape[1],)
+        Ksig_train = build_kernel_from_signatures(X_sig_train)
+        beta_w, u_pred_train, f_pred_train, rhs_true_train = solvebetas(Ksig=Ksig_train,f=f_train,x=t_train,ua=ua, upa=upa,k1=k1,k2=k2,k3=k3,reg = reg)
+        u_pred_full = u_pred_train.clone()
+        f_pred_full = f_pred_train.clone()
+        print(
+            f"initial train integrated-target loss: "
+            f"{forcing_loss(rhs_true_train, f_pred_train).item():.3e}"
+        )
+
+        # Loop over test points; at step j we evaluate on [train | first j test]
+        N_train = t_train.numel()
+        N_test = t_test.numel()
+        for j in range(1, N_test + 1):
+            #Retrain if at retraining step
+            if (j % retrain_every) == 0:
+                t_retrain = torch.cat([t_train, t_test[:j]], dim=0)
+                f_retrain = torch.cat([f_train, f_test[:j]], dim=0)
+                X_train = torch.stack([t_retrain, f_retrain], dim=1)  # (T,2)
+                X_train = tlift(X_train, t_lift_value)
+                X_sig_train = compute_signatures(X_train, depth)     # (T,D)
+                if(normalize == True):
+                    X_sig_train = normalize_signatures(Z=X_sig_train,depth=depth,dim=X_train.shape[1],)
+                Ksig_train = build_kernel_from_signatures(X_sig_train)
+                beta_w, u_pred_train, f_pred_train, rhs_true_train = solvebetas(Ksig=Ksig_train,f=f_retrain,x=t_retrain,ua=ua, upa=upa,k1=k1,k2=k2,k3=k3,reg = reg)
+
+            #Build new training path by adding new points onto current training path
+            x_curr = torch.cat([t_train, t_test[:j]], dim=0)
+            f_curr = torch.cat([f_train, f_test[:j]], dim=0)
+            X_curr = torch.stack([x_curr, f_curr], dim=1)
+            X_curr = tlift(X_curr, t_lift_value)
+
+
+            #Compute Signatures of new path and normalize
+            X_sig_curr = compute_signatures(X_curr, depth)
+            if(normalize == True):
+                _, X_sig_curr = apply_signature_normalization_pair(X_sig_train, X_sig_curr, depth=depth, dim=X_train.shape[1],)
+
+            #Build Kernels and Operatprs
+            Ksig_curr_train = build_kernel_from_different_signatures(X_sig_curr, X_sig_train)
+            Ku2_curr, Kup_curr, Ku_curr = buildkerneloperators(Ksig_curr_train, x_curr)
+
+            # Evaluate on current grid
+            u_curr, u_p_curr, u_dd_curr = evaluate_solution_from_beta(Ku2_curr, Kup_curr, Ku_curr, x_curr, beta_w, ua, upa)
+            f_curr_pred = evaluate_forcing_from_solution(u_curr, u_p_curr, u_dd_curr, k1, k2, k3)
+
+            # append only the new test part onto the end of the tensors
+            u_pred_full = torch.cat([u_pred_full, u_curr[N_train + j - 1:N_train + j]], dim=0)
+            f_pred_full = torch.cat([f_pred_full, f_curr_pred[N_train + j - 1:N_train + j]], dim=0)
+
+    #Testing done, print accuracy of forcing
+    t_all = torch.cat([t_train, t_test], dim=0)
+    f_all = torch.cat([f_train, f_test], dim=0)
+    final_loss = forcing_loss(f_all, f_pred_full)
+    print(f"final forcing loss (train+test, last beta): {final_loss.item():.3e}")
+
+    return u_pred_full, f_pred_full
+
+def tlift(X, holder_value):
+    """
+    Time-lift a path by appending x^(2H) as an extra channel.
+
+    Parameters
+    ----------
+    X : torch.Tensor, shape (T, d)
+        Path whose first column is assumed to be the time/grid variable x.
+    holder_value : float
+        Hölder exponent H.
+
+    Returns
+    -------
+    X_tlift : torch.Tensor, shape (T, d+1)
+        Original path with appended channel x^(2H).
+    """
+    if X.ndim != 2:
+        raise ValueError("X must have shape (T, d)")
+
+    x = X[:, 0]
+    H = holder_value
+
+    x_lift = torch.pow(x, 2.0 * H).unsqueeze(1)
+    X_tlift = torch.cat([X, x_lift], dim=1)
+    return X_tlift
+
+
 
 
 
@@ -277,26 +543,216 @@ def rel_mse(pred, true):
     pred = pred.to(true.device)
     return torch.mean((pred - true) ** 2).item() / torch.mean(true ** 2).item()
 
-def print_errors(F_pred, F_star, U_pred, U_true):
-    # Ensure predictions on same device as references
-    F_pred = F_pred.to(F_star.device)
-    U_pred = U_pred.to(U_true.device)
 
-    # Forcing errors
-    abs_mse_F = mse(F_pred, F_star)
-    rel_mse_F = rel_mse(F_pred, F_star)
 
-    # Solution errors
-    abs_mse_u = mse(U_pred, U_true)
-    rel_mse_u = rel_mse(U_pred, U_true)
 
-    print("\n==============================")
-    print("Model Error Summary")
-    print("==============================")
-    print(f"{'Quantity':20s} {'Absolute MSE':>18s} {'Relative MSE':>18s} {'Relative MSE (%)':>20s}")
-    print("-" * 80)
-    print(f"{'Forcing F*':20s} {abs_mse_F:>18.6e} {rel_mse_F:>18.6e} {100 * rel_mse_F:>19.4f}%")
-    print(f"{'Solution u(t)':20s} {abs_mse_u:>18.6e} {rel_mse_u:>18.6e} {100 * rel_mse_u:>19.4f}%")
+def plot_normal_vs_tlift(
+    t_vals: torch.Tensor,
+    TRAIN_FRAC: float,
+    u_pred_full: torch.Tensor,
+    f_pred_full: torch.Tensor,
+    u_pred_full_tlift: torch.Tensor,
+    f_pred_full_tlift: torch.Tensor,
+    U_ref: torch.Tensor,
+    F_star: torch.Tensor,
+):
+    """
+    2x2 plot: forcing and solution, normal vs t-lift,
+    with a vertical line at the train/test split.
+    """
+    # Indices and split
+    N        = t_vals.numel()
+    N_train  = int(N * TRAIN_FRAC)
+    idx_train = torch.arange(0, N_train)
+    idx_test  = torch.arange(N_train, N)
+
+    t_train = t_vals[idx_train]
+    t_test  = t_vals[idx_test]
+    t_split = float(t_vals[N_train - 1].item())
+
+    # Convert to lists for matplotlib
+    def _tolist(x):
+        if isinstance(x, torch.Tensor):
+            return x.detach().cpu().tolist()
+        return list(x)
+
+    t_train_l = _tolist(t_train)
+    t_test_l  = _tolist(t_test)
+
+    F_star_train_l = _tolist(F_star[idx_train])
+    F_star_test_l  = _tolist(F_star[idx_test])
+
+    f_norm_train_l = _tolist(f_pred_full[idx_train])
+    f_norm_test_l  = _tolist(f_pred_full[idx_test])
+
+    f_tlift_train_l = _tolist(f_pred_full_tlift[idx_train])
+    f_tlift_test_l  = _tolist(f_pred_full_tlift[idx_test])
+
+    u_ref_train_l = _tolist(U_ref[idx_train])
+    u_ref_test_l  = _tolist(U_ref[idx_test])
+
+    u_norm_train_l = _tolist(u_pred_full[idx_train])
+    u_norm_test_l  = _tolist(u_pred_full[idx_test])
+
+    u_tlift_train_l = _tolist(u_pred_full_tlift[idx_train])
+    u_tlift_test_l  = _tolist(u_pred_full_tlift[idx_test])
+
+    # Plot style (reuse style from other helpers)
+    plt.rcParams.update({
+        "font.family": "serif",
+        "font.size": 13,
+        "axes.labelsize": 15,
+        "axes.titlesize": 16,
+        "legend.fontsize": 12,
+        "xtick.labelsize": 12,
+        "ytick.labelsize": 12,
+        "axes.linewidth": 1.1,
+        "figure.dpi": 150,
+        "savefig.dpi": 300,
+        "savefig.bbox": "tight",
+    })
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+
+    # --- Top-left: Forcing, normal ---
+    ax = axes[0, 0]
+    ax.plot(t_train_l, F_star_train_l,
+            color="black", linewidth=1.5, label="True F*")
+    ax.plot(t_train_l, f_norm_train_l,
+            color="red", linestyle="--", linewidth=1.5)
+    ax.plot(t_test_l,  F_star_test_l,
+            color="black", linewidth=1.5)
+    ax.plot(t_test_l,  f_norm_test_l,
+            color="red", linestyle="--", linewidth=1.5,
+            label="normal pred F*")
+    ax.axvline(x=t_split, color="gray", linestyle=":", linewidth=1.4,
+               label="Train/test split")
+    ax.set_title("Forcing: normal vs true")
+    ax.set_xlabel("t")
+    ax.set_ylabel("F*(t)")
+    ax.legend(frameon=True, fancybox=False, edgecolor="black")
+
+    # --- Top-right: Forcing, t-lift ---
+    ax = axes[0, 1]
+    ax.plot(t_train_l, F_star_train_l,
+            color="black", linewidth=1.5, label="True F*")
+    ax.plot(t_train_l, f_tlift_train_l,
+            color="blue", linestyle="--", linewidth=1.5)
+    ax.plot(t_test_l,  F_star_test_l,
+            color="black", linewidth=1.5)
+    ax.plot(t_test_l,  f_tlift_test_l,
+            color="blue", linestyle="--", linewidth=1.5,
+            label="t-lift pred F*")
+    ax.axvline(x=t_split, color="gray", linestyle=":", linewidth=1.4,
+               label="Train/test split")
+    ax.set_title("Forcing: t-lift vs true")
+    ax.set_xlabel("t")
+    ax.set_ylabel("F*(t)")
+    ax.legend(frameon=True, fancybox=False, edgecolor="black")
+
+    # --- Bottom-left: Solution, normal ---
+    ax = axes[1, 0]
+    ax.plot(t_train_l, u_ref_train_l,
+            color="black", linewidth=1.5, label="reference u(t)")
+    ax.plot(t_train_l, u_norm_train_l,
+            color="red", linestyle="--", linewidth=1.5)
+    ax.plot(t_test_l,  u_ref_test_l,
+            color="black", linewidth=1.5)
+    ax.plot(t_test_l,  u_norm_test_l,
+            color="red", linestyle="--", linewidth=1.5,
+            label="normal pred u(t)")
+    ax.axvline(x=t_split, color="gray", linestyle=":", linewidth=1.2,
+               label="Train/test split")
+    ax.set_title("Solution: normal vs reference")
+    ax.set_xlabel("t")
+    ax.set_ylabel("u(t)")
+    ax.legend(frameon=True, fancybox=False, edgecolor="black")
+
+    # --- Bottom-right: Solution, t-lift ---
+    ax = axes[1, 1]
+    ax.plot(t_train_l, u_ref_train_l,
+            color="black", linewidth=1.5, label="reference u(t)")
+    ax.plot(t_train_l, u_tlift_train_l,
+            color="blue", linestyle="--", linewidth=1.5)
+    ax.plot(t_test_l,  u_ref_test_l,
+            color="black", linewidth=1.5)
+    ax.plot(t_test_l,  u_tlift_test_l,
+            color="blue", linestyle="--", linewidth=1.5,
+            label="t-lift pred u(t)")
+    ax.axvline(x=t_split, color="gray", linestyle=":", linewidth=1.2,
+               label="Train/test split")
+    ax.set_title("Solution: t-lift vs reference")
+    ax.set_xlabel("t")
+    ax.set_ylabel("u(t)")
+    ax.legend(frameon=True, fancybox=False, edgecolor="black")
+
+    fig.tight_layout()
+    plt.show()
+
+
+def print_normal_vs_tlift(
+    t_vals: torch.Tensor,
+    TRAIN_FRAC: float,
+    u_pred_full: torch.Tensor,
+    f_pred_full: torch.Tensor,
+    u_pred_full_tlift: torch.Tensor,
+    f_pred_full_tlift: torch.Tensor,
+    U_ref: torch.Tensor,
+    F_star: torch.Tensor,
+):
+    """
+    Print relative MSE table for forcing and solution:
+    normal vs t-lift, split into train / test.
+    """
+    # Indices
+    N        = t_vals.numel()
+    N_train  = int(N * TRAIN_FRAC)
+    idx_train = torch.arange(0, N_train)
+    idx_test  = torch.arange(N_train, N)
+
+    def rel_mse(pred, true):
+        pred = pred.to(true.device)
+        return torch.mean((pred - true) ** 2).item() / torch.mean(true ** 2).item()
+
+    def pct_imp(nb, b):
+        # percent improvement going from normal (nb) to t-lift (b)
+        return (nb - b) / abs(nb) * 100 if nb != 0 else float("nan")
+
+    # Training relative MSEs
+    mse_train_F_norm   = rel_mse(f_pred_full[idx_train],         F_star[idx_train])
+    mse_train_u_norm   = rel_mse(u_pred_full[idx_train],         U_ref[idx_train])
+    mse_train_F_tlift  = rel_mse(f_pred_full_tlift[idx_train],   F_star[idx_train])
+    mse_train_u_tlift  = rel_mse(u_pred_full_tlift[idx_train],   U_ref[idx_train])
+
+    # Testing relative MSEs
+    mse_test_F_norm   = rel_mse(f_pred_full[idx_test],         F_star[idx_test])
+    mse_test_u_norm   = rel_mse(u_pred_full[idx_test],         U_ref[idx_test])
+    mse_test_F_tlift  = rel_mse(f_pred_full_tlift[idx_test],   F_star[idx_test])
+    mse_test_u_tlift  = rel_mse(u_pred_full_tlift[idx_test],   U_ref[idx_test])
+
+    print(f"\n{'':25s} {'Normal':>15} {'t-lift':>16} {'% Improvement':>14}")
+    print("-" * 72)
+    print(
+        f"{'Training forcing':25s} "
+        f"{mse_train_F_norm:>15.4e} {mse_train_F_tlift:>16.4e} "
+        f"{pct_imp(mse_train_F_norm, mse_train_F_tlift):>13.2f}%"
+    )
+    print(
+        f"{'Training solution':25s} "
+        f"{mse_train_u_norm:>15.4e} {mse_train_u_tlift:>16.4e} "
+        f"{pct_imp(mse_train_u_norm, mse_train_u_tlift):>13.2f}%"
+    )
+    print(
+        f"{'Testing forcing':25s} "
+        f"{mse_test_F_norm:>15.4e} {mse_test_F_tlift:>16.4e} "
+        f"{pct_imp(mse_test_F_norm, mse_test_F_tlift):>13.2f}%"
+    )
+    print(
+        f"{'Testing solution':25s} "
+        f"{mse_test_u_norm:>15.4e} {mse_test_u_tlift:>16.4e} "
+        f"{pct_imp(mse_test_u_norm, mse_test_u_tlift):>13.2f}%"
+    )
+
 
 
 # -------------------------------------------------------
@@ -377,8 +833,9 @@ def build_paths(F_t: pd.DataFrame,
 # -------------------------------------------------------
 # Initial training state
 # -------------------------------------------------------
-
-def build_state(paths, n0: int, signature_level: int,
+def build_state(paths,
+                n0: int,
+                signature_level: int,
                 m: float, c: float, k: float,
                 dt: float, N: int,
                 F_star: torch.Tensor,
@@ -388,34 +845,39 @@ def build_state(paths, n0: int, signature_level: int,
     Train on the first n0+1 paths and return a state dict
     ready for rolling_online_predict.
     """
+
+    # --- move inputs to device once ---
+    F_star = F_star.to(device)
+    t_vals = t_vals.to(device)
+    u_true_interp = u_true_interp.to(device)
+
+    # signatures for first n0+1 paths
     S0_raw = torch.stack([
         signature_of_path(paths[i], depth=signature_level)
         for i in range(n0 + 1)
-    ])
+    ])  # signature_of_path already returns on `device`
 
     med, iqr = robust_fit(S0_raw)
     S0 = robust_apply(S0_raw, med, iqr)
 
-    K0   = S0 @ S0.T
+    K0   = S0 @ S0.T                    # (n0+1, n0+1), on device
     K1_0 = trapezoidal_cols(K0, dt)
     K2_0 = trapezoidal_cols(K1_0, dt)
 
-    Psi0  = m * K0 + c * K1_0 + k * K2_0
+    Psi0 = m * K0 + c * K1_0 + k * K2_0
 
     rcond = torch.finfo(torch.float64).eps
-    Psi0.to(device)
-    F_star.to(device)
     alpha0 = torch.linalg.lstsq(
-        Psi0, F_star[:n0 + 1], rcond=rcond, driver='gelsd'
+        Psi0, F_star[:n0 + 1], rcond=rcond, driver="gelsd"
     ).solution
 
     F_pred_train = Psi0 @ alpha0
-    u_pred_train = K0   @ alpha0
+    u_pred_train = K0  @ alpha0
 
     return {
         "m": m, "c": c, "k": k,
         "dt": dt, "n0": n0, "N": N,
-        "paths": paths,
+        "paths": paths,                     # lists of tensors; signature_of_path handles device
         "signature_level": signature_level,
         "med": med, "iqr": iqr,
         "F_star": F_star,
@@ -429,7 +891,6 @@ def build_state(paths, n0: int, signature_level: int,
         "F_pred_train": F_pred_train,
         "u_pred_train": u_pred_train,
     }
-
 
 # -------------------------------------------------------
 # Rolling online prediction
@@ -526,161 +987,83 @@ def rolling_online_predict(state: dict,
     }
 
 
-def plot_branched_vs_nonbranched(
-    t_vals: torch.Tensor,
-    n0: int,
-    F_star: torch.Tensor,
-    F_pred_train_nb: torch.Tensor,
-    F_pred_train_b: torch.Tensor,
-    u_true_interp: torch.Tensor,
-    u_pred_train_nb: torch.Tensor,
-    u_pred_train_b: torch.Tensor,
-    res_nb: dict,
-    res_b: dict,
+
+def solve_signature_kernel_rolling_retrain(
+    t_train: torch.Tensor,
+    t_test: torch.Tensor,
+    f_train: torch.Tensor,
+    f_test: torch.Tensor,
+    k1, k2, k3,
+    ua, upa,
+    depth, normalize = True, reg = 1e-10,
+    retrain_every: int = 10,
 ):
     """
-    2x2 plot: forcing and solution, non-branched vs branched (t-lift),
-    with train/test split and retrain markers.
+    Non-branched testing with periodic retraining.
     """
-    # Plot style
-    plt.rcParams.update({
-        "font.family": "serif",
-        "font.size": 13,
-        "axes.labelsize": 15,
-        "axes.titlesize": 16,
-        "legend.fontsize": 12,
-        "xtick.labelsize": 12,
-        "ytick.labelsize": 12,
-        "axes.linewidth": 1.1,
-        "figure.dpi": 150,
-        "savefig.dpi": 300,
-        "savefig.bbox": "tight",
-    })
 
-    # Indices
-    idx_train   = torch.arange(0, n0 + 1)
-    idx_test_b  = torch.arange(n0 + 1, res_b["end_idx"]  + 1)
-    idx_test_nb = torch.arange(n0 + 1, res_nb["end_idx"] + 1)
-
-    t_train   = t_vals[idx_train]
-    t_test_b  = t_vals[idx_test_b]
-    t_test_nb = t_vals[idx_test_nb]
-    t_split   = float(t_vals[n0].item())
-
-    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
-
-    # --- Top-left: Forcing, non-branched ---
-    ax = axes[0, 0]
-    ax.plot(t_train.tolist(), F_star[idx_train].tolist(),
-            color="black", linewidth=1.5, label="True f(t)")
-    ax.plot(t_train.tolist(), F_pred_train_nb.tolist(),
-            color="red", linestyle="--", linewidth=1.5)
-    ax.plot(t_test_nb.tolist(), F_star[idx_test_nb].tolist(),
-            color="black", linewidth=1.5)
-    ax.plot(t_test_nb.tolist(), res_nb["F_pred"][idx_test_nb].tolist(),
-            color="red", linestyle="--", linewidth=1.5, label="no t-lift pred f")
-    ax.axvline(x=t_split, color="gray", linestyle=":", linewidth=1.4, label="Train/test split")
-    ax.set_title("Forcing: no t-lift vs true")
-    ax.set_xlabel("t")
-    ax.set_ylabel("f(t)")
-    ax.legend(frameon=True, fancybox=False, edgecolor="black")
-
-    # --- Top-right: Forcing, branched ---
-    ax = axes[0, 1]
-    ax.plot(t_train.tolist(), F_star[idx_train].tolist(),
-            color="black", linewidth=1.5, label="True f(t)")
-    ax.plot(t_train.tolist(), F_pred_train_b.tolist(),
-            color="blue", linestyle="--", linewidth=1.5)
-    ax.plot(t_test_b.tolist(), F_star[idx_test_b].tolist(),
-            color="black", linewidth=1.5)
-    ax.plot(t_test_b.tolist(), res_b["F_pred"][idx_test_b].tolist(),
-            color="blue", linestyle="--", linewidth=1.5, label="t-lift pred f")
-    ax.axvline(x=t_split, color="gray", linestyle=":", linewidth=1.4, label="Train/test split")
-    ax.set_title("Forcing: t-lift vs true")
-    ax.set_xlabel("t")
-    ax.set_ylabel("f(t)")
-    ax.legend(frameon=True, fancybox=False, edgecolor="black")
-
-    # --- Bottom-left: Solution, non-branched ---
-    ax = axes[1, 0]
-    ax.plot(t_train.tolist(), u_true_interp[idx_train].tolist(),
-            color="black", linewidth=1.5, label="reference u(t)")
-    ax.plot(t_train.tolist(), u_pred_train_nb.tolist(),
-            color="red", linestyle="--", linewidth=1.5)
-    ax.plot(t_test_nb.tolist(), u_true_interp[idx_test_nb].tolist(),
-            color="black", linewidth=1.5)
-    ax.plot(t_test_nb.tolist(), res_nb["u_pred"][idx_test_nb].tolist(),
-            color="red", linestyle="--", linewidth=1.5, label="no t-lift prediction u(t)")
-    ax.axvline(x=t_split, color="gray", linestyle=":", linewidth=1.2, label="Train/test split")
-    ax.set_title("Solution: No t-lift vs Reference")
-    ax.set_xlabel("t")
-    ax.set_ylabel("u(t)")
-    ax.legend(frameon=True, fancybox=False, edgecolor="black")
-
-    # --- Bottom-right: Solution, branched ---
-    ax = axes[1, 1]
-    ax.plot(t_train.tolist(), u_true_interp[idx_train].tolist(),
-            color="black", linewidth=1.5, label="reference u(t)")
-    ax.plot(t_train.tolist(), u_pred_train_b.tolist(),
-            color="blue", linestyle="--", linewidth=1.5)
-    ax.plot(t_test_b.tolist(), u_true_interp[idx_test_b].tolist(),
-            color="black", linewidth=1.5)
-    ax.plot(t_test_b.tolist(), res_b["u_pred"][idx_test_b].tolist(),
-            color="blue", linestyle="--", linewidth=1.5, label="t-lift prediction u(t)")
-    ax.axvline(x=t_split, color="gray", linestyle=":", linewidth=1.2, label="Train/test split")
-    ax.set_title("Solution: t-lift vs Reference")
-    ax.set_xlabel("t")
-    ax.set_ylabel("u(t)")
-    ax.legend(frameon=True, fancybox=False, edgecolor="black")
-
-    fig.tight_layout()
-    plt.show()
+    u_pred_full = []
+    f_pred_full = []
 
 
-def summarize_branched_vs_nonbranched_errors(
-    t_vals: torch.Tensor,
-    n0: int,
-    F_star: torch.Tensor,
-    u_true_interp: torch.Tensor,
-    F_pred_train_nb: torch.Tensor,
-    F_pred_train_b: torch.Tensor,
-    u_pred_train_nb: torch.Tensor,
-    u_pred_train_b: torch.Tensor,
-    res_nb: dict,
-    res_b: dict,
+    with torch.no_grad():
+        #Train first
+        X_train = torch.stack([t_train, f_train], dim=1)           # (T,2)
+        X_sig_train = compute_signatures(X_train, depth)     # (T,D)
+        if(normalize == True):
+            X_sig_train = normalize_signatures(Z=X_sig_train,depth=depth,dim=X_train.shape[1],)
+        Ksig_train = build_kernel_from_signatures(X_sig_train)
+        beta_w, u_pred_train, f_pred_train, rhs_true_train = solvebetas(Ksig=Ksig_train,f=f_train,x=t_train,ua=ua, upa=upa,k1=k1,k2=k2,k3=k3,reg = reg)
+        u_pred_full = u_pred_train.clone()
+        f_pred_full = f_pred_train.clone()
+        print(
+            f"initial train integrated-target loss: "
+            f"{forcing_loss(rhs_true_train, f_pred_train).item():.3e}"
+        )
+
+        print("George please implement the rest. keep the function parameter/signature the same and return the same. try to use the functions i used except for you rolling retrain")
+
+
+    return u_pred_full, f_pred_full
+
+
+def solve_signature_kernel_rolling_retrain_tlift(
+    t_train: torch.Tensor,
+    t_test: torch.Tensor,
+    f_train: torch.Tensor,
+    f_test: torch.Tensor,
+    k1, k2, k3,
+    ua, upa,
+    depth, normalize = True, 
+    t_lift_value = .5,
+    reg = 1e-10,
+    retrain_every: int = 10,
 ):
     """
-    Print relative MSE table for forcing and solution:
-    non-branched vs t-lift branched, split into train / test.
+    Non-branched testing with periodic retraining.
     """
-    def rel_mse(pred, true):
-        return torch.mean((pred - true) ** 2).item() / torch.mean(true ** 2).item()
 
-    def pct_imp(nb, b):
-        # percent improvement going from non-branched (nb) to branched (b)
-        return (nb - b) / abs(nb) * 100 if nb != 0 else float("nan")
+    u_pred_full = []
+    f_pred_full = []
 
-    # Indices
-    idx_train   = torch.arange(0, n0 + 1)
-    idx_test_b  = torch.arange(n0 + 1, res_b["end_idx"]  + 1)
-    idx_test_nb = torch.arange(n0 + 1, res_nb["end_idx"] + 1)
 
-    # Training relative MSEs
-    mse_train_F_nb = rel_mse(F_pred_train_nb, F_star[idx_train])
-    mse_train_u_nb = rel_mse(u_pred_train_nb, u_true_interp[idx_train])
-    mse_train_F_b  = rel_mse(F_pred_train_b,  F_star[idx_train])
-    mse_train_u_b  = rel_mse(u_pred_train_b,  u_true_interp[idx_train])
+    with torch.no_grad():
+        #Train first
+        X_train = torch.stack([t_train, f_train], dim=1)           # (T,2)
+        X_train = tlift(X_train, t_lift_value)
+        X_sig_train = compute_signatures(X_train, depth)     # (T,D)
+        if(normalize == True):
+            X_sig_train = normalize_signatures(Z=X_sig_train,depth=depth,dim=X_train.shape[1],)
+        Ksig_train = build_kernel_from_signatures(X_sig_train)
+        beta_w, u_pred_train, f_pred_train, rhs_true_train = solvebetas(Ksig=Ksig_train,f=f_train,x=t_train,ua=ua, upa=upa,k1=k1,k2=k2,k3=k3,reg = reg)
+        u_pred_full = u_pred_train.clone()
+        f_pred_full = f_pred_train.clone()
+        print(
+            f"initial train integrated-target loss: "
+            f"{forcing_loss(rhs_true_train, f_pred_train).item():.3e}"
+        )
 
-    # Testing relative MSEs
-    mse_test_F_nb = rel_mse(res_nb["F_pred"][idx_test_nb], F_star[idx_test_nb])
-    mse_test_u_nb = rel_mse(res_nb["u_pred"][idx_test_nb], u_true_interp[idx_test_nb])
-    mse_test_F_b  = rel_mse(res_b["F_pred"][idx_test_b],   F_star[idx_test_b])
-    mse_test_u_b  = rel_mse(res_b["u_pred"][idx_test_b],   u_true_interp[idx_test_b])
+        
+        print("George please implement the rest. keep the function parameter/signature the same and return the same. try to use the functions i used except for you rolling retrain")
 
-    # Print table
-    print(f"\n{'':25s} {'Non-Branched':>15} {'t-lift Branched':>16} {'% Improvement':>14}")
-    print("-" * 72)
-    print(f"{'Training forcing':25s} {mse_train_F_nb:>15.4e} {mse_train_F_b:>16.4e} {pct_imp(mse_train_F_nb, mse_train_F_b):>13.2f}%")
-    print(f"{'Training solution':25s} {mse_train_u_nb:>15.4e} {mse_train_u_b:>16.4e} {pct_imp(mse_train_u_nb, mse_train_u_b):>13.2f}%")
-    print(f"{'Testing forcing':25s} {mse_test_F_nb:>15.4e} {mse_test_F_b:>16.4e} {pct_imp(mse_test_F_nb, mse_test_F_b):>13.2f}%")
-    print(f"{'Testing solution':25s} {mse_test_u_nb:>15.4e} {mse_test_u_b:>16.4e} {pct_imp(mse_test_u_nb, mse_test_u_b):>13.2f}%")
+    return u_pred_full, f_pred_full
