@@ -193,40 +193,40 @@ def build_rhs(f: torch.Tensor, x: torch.Tensor,
     q = k1 * ua + (k1 * upa + k2 * ua) * (x - x0)
     return double_integrate(f, x) + q
 
-def solvebetas(Ksig: torch.Tensor,
-                      f: torch.Tensor,
-                      x: torch.Tensor,
-                      ua: float,
-                      upa: float,
-                      k1: float,
-                      k2: float,
-                      k3: float,
-                      reg: float = 1e-10):
-    dtype = torch.float64
-    device = Ksig.device
+# def solvebetas(Ksig: torch.Tensor,
+#                       f: torch.Tensor,
+#                       x: torch.Tensor,
+#                       ua: float,
+#                       upa: float,
+#                       k1: float,
+#                       k2: float,
+#                       k3: float,
+#                       reg: float = 1e-10):
+#     dtype = torch.float64
+#     device = Ksig.device
 
-    Ksig = Ksig.to(device=device, dtype=dtype)
-    x = x.to(device=device, dtype=dtype)
-    f = f.to(device=device, dtype=dtype)
+#     Ksig = Ksig.to(device=device, dtype=dtype)
+#     x = x.to(device=device, dtype=dtype)
+#     f = f.to(device=device, dtype=dtype)
 
-    K0, IK, I2K = buildkerneloperators(Ksig, x)
+#     K0, IK, I2K = buildkerneloperators(Ksig, x)
 
-    A = k1 * K0 + k2 * IK + k3 * I2K
-    rhs = build_rhs(f, x, ua, upa, k1, k2).to(device=device, dtype=dtype)
+#     A = k1 * K0 + k2 * IK + k3 * I2K
+#     rhs = build_rhs(f, x, ua, upa, k1, k2).to(device=device, dtype=dtype)
 
-    N = Ksig.shape[0]
-    Ireg = torch.eye(N, dtype=dtype, device=device)
-    rcond = torch.finfo(torch.float64).eps
-    beta = torch.linalg.lstsq(A, rhs,rcond = rcond, driver = 'gels').solution
-    #A = torch.linalg.lstsq(Psi, F_star, rcond=rcond, driver='gelsd').solution
-    u = K0 @ beta
-    Iu = IK @ beta
-    I2u = I2K @ beta
-    rhs_pred = k1 * u + k2 * Iu + k3 * I2u
+#     N = Ksig.shape[0]
+#     Ireg = torch.eye(N, dtype=dtype, device=device)
+#     rcond = torch.finfo(torch.float64).eps
+#     beta = torch.linalg.lstsq(A, rhs,rcond = rcond, driver = 'gels').solution
+#     #A = torch.linalg.lstsq(Psi, F_star, rcond=rcond, driver='gelsd').solution
+#     u = K0 @ beta
+#     Iu = IK @ beta
+#     I2u = I2K @ beta
+#     rhs_pred = k1 * u + k2 * Iu + k3 * I2u
 
-    return beta, u, rhs_pred, rhs
+#     return beta, u, rhs_pred, rhs
 
-def solvebetas1(
+def solvebetas(
     Ksig: torch.Tensor,
     f: torch.Tensor,
     x: torch.Tensor,
