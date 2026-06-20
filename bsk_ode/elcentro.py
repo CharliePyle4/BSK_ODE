@@ -216,8 +216,8 @@ def solvebetas(Ksig: torch.Tensor,
 
     N = Ksig.shape[0]
     Ireg = torch.eye(N, dtype=dtype, device=device)
-    beta = torch.linalg.solve(A.T @ A + reg * Ireg, A.T @ rhs)
-
+    beta = torch.linalg.solve(A, rhs,rcond = rcond).solution
+    #A = torch.linalg.lstsq(Psi, F_star, rcond=rcond, driver='gelsd').solution
     u = K0 @ beta
     Iu = IK @ beta
     I2u = I2K @ beta
