@@ -288,7 +288,7 @@ def solvebetas1(
         Psi.cpu(),
         F_star.cpu(),
         rcond=rcond,
-        driver="gelsd",
+        driver="gels",
     ).solution.to(device)
 
     # Reconstruct displacement estimate:
