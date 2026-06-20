@@ -275,16 +275,19 @@ def solvebetas(
     k1: float,
     k2: float,
     k3: float,
-    reg: float = 0.0,          # kept for API compatibility; not used here
-    rcond: float | None = None,
+    reg: float = 1e-10,   # kept only so the rest of your code still works
 ):
     """
-    GPU-compatible approximation of CPU lstsq(..., driver='gelsd').
+    GPU/T4 version of:
 
-    Solves Psi @ beta ~= F_star using a truncated SVD pseudoinverse:
-        beta = V @ diag(1 / S_kept) @ U.T @ F_star
+        beta = torch.linalg.lstsq(
+            Psi,
+            F_star,
+            rcond=torch.finfo(torch.float64).eps,
+            driver="gelsd"
+        ).solution
 
-    Singular values <= rcond * largest_singular_value are discarded.
+    using a truncated SVD pseudoinverse directly on CUDA.
     """
 
     dtype = torch.float64
@@ -294,23 +297,34 @@ def solvebetas(
     x = x.to(device=device, dtype=dtype).flatten()
     f = f.to(device=device, dtype=dtype).flatten()
 
-    # K0 = K, IK = K1, I2K = K2
-    K0, IK, I2K = buildkerneloperators(Ksig, x)
+    # Match your standalone notebook exactly:
+    #
+    # K  = S @ S.T
+    # K1 = trapezoidal_cols(K, dt)
+    # K2 = trapezoidal_cols(K1, dt)
+    #
+    dt = x[1] - x[0]
 
-    # Psi = m*K + c*K1 + k*K2
+    K0 = Ksig
+    IK = trapezoidal_cols(K0, dt)
+    I2K = trapezoidal_cols(IK, dt)
+
+    # Same as:
+    # Psi = m * K + c * K1 + k * K2
     Psi = k1 * K0 + k2 * IK + k3 * I2K
 
-    # F_star = double trapezoidal integral of forcing
-    dt = x[1] - x[0]
+    # Same as:
+    # F_star = trapezoidal_cols(trapezoidal_cols(F_vals, dt), dt)
     F_star = trapezoidal_cols(
         trapezoidal_cols(f, dt),
         dt,
     )
 
+    # Your standalone code assumes zero initial conditions.
     if ua != 0.0 or upa != 0.0:
         print(
-            "Warning: this version matches the zero-initial-condition "
-            "notebook formulation and ignores nonzero ua / upa."
+            "Warning: this GPU SVD version matches the standalone notebook "
+            "and ignores nonzero ua / upa."
         )
 
     if not torch.isfinite(Psi).all():
@@ -319,48 +333,49 @@ def solvebetas(
     if not torch.isfinite(F_star).all():
         raise ValueError("F_star contains NaN or Inf before SVD.")
 
-    # Match PyTorch's default-style scale reasonably closely:
-    # machine epsilon * max(m, n)
-    if rcond is None:
-        rcond = torch.finfo(dtype).eps * max(Psi.shape)
+    # Same cutoff idea as:
+    # rcond = torch.finfo(torch.float64).eps
+    rcond = torch.finfo(dtype).eps
 
-    # CUDA SVD: works on the T4.
-    # full_matrices=False is important to avoid unnecessary memory use.
+    # GPU SVD. This genuinely runs on the T4 if Psi is on cuda:0.
     U, S, Vh = torch.linalg.svd(Psi, full_matrices=False)
 
+    # Same logic as gelsd:
+    # discard singular-value directions that are numerically zero.
     cutoff = rcond * S[0]
     keep = S > cutoff
 
-    # Truncated-SVD pseudoinverse solve.
-    # Equivalent in spirit to gelsd's rank-truncated least squares.
-    Ut_b = U.transpose(-2, -1) @ F_star
+    S_inv = torch.zeros_like(S)
+    S_inv[keep] = 1.0 / S[keep]
 
-    Sinv = torch.zeros_like(S)
-    Sinv[keep] = 1.0 / S[keep]
-
-    beta = Vh.transpose(-2, -1) @ (Sinv * Ut_b)
+    # Equivalent to:
+    # beta = pinv(Psi) @ F_star
+    beta = Vh.transpose(-2, -1) @ (
+        S_inv * (U.transpose(-2, -1) @ F_star)
+    )
 
     if not torch.isfinite(beta).all():
         raise ValueError(
-            f"beta contains NaN/Inf after GPU SVD solve. "
-            f"Try a larger rcond. Current rcond={rcond:.3e}"
+            "beta contains NaN/Inf after GPU truncated-SVD solve. "
+            "Use a larger singular-value cutoff."
         )
 
+    # Same reconstruction logic as before
     u = K0 @ beta
     Iu = IK @ beta
     I2u = I2K @ beta
 
-    # This is the model-implied F_star prediction.
+    # This is Psi @ beta, the prediction of F_star
     rhs_pred = k1 * u + k2 * Iu + k3 * I2u
 
     print(
-        f"GPU SVD solve | device={device} | "
-        f"effective rank={keep.sum().item()}/{len(S)} | "
-        f"rcond={rcond:.3e} | cutoff={cutoff.item():.3e}"
+        f"GPU SVD | device={Psi.device} | "
+        f"rank={keep.sum().item()}/{len(S)} | "
+        f"rcond={rcond:.3e} | "
+        f"cutoff={cutoff.item():.3e}"
     )
 
     return beta, u, rhs_pred, F_star
-
 
 def evaluate_forcing_from_solution(
     u: torch.Tensor,      # really u
