@@ -127,7 +127,7 @@ def signature_of_path(path, depth: int = 3) -> torch.Tensor:
     )
 
     # (1, D) → (D,)
-    return sig_raw.squeeze(0).detach()
+    return sig_raw.squeeze(0).to(torch.float64).detach()
 
 def interpolate_to_grid(t_source, y_source, t_target):
     idx = torch.searchsorted(t_source.contiguous(), t_target.contiguous())
@@ -395,7 +395,7 @@ def run_full_batch(
         depth        = signature_level,
         stream       = True,
         gpu_optimized = True,
-    ).squeeze(0).detach().cpu().numpy()
+    ).squeeze(0).to(torch.float64).detach().cpu().numpy()
 
     S   = sigs
     N_full = len(S)
