@@ -284,15 +284,11 @@ def solvebetas(
 
     rcond = torch.finfo(dtype).eps
 
-    lam = 1e-4
-
-    N = Psi.shape[1]
-    I = torch.eye(N, dtype=Psi.dtype, device=Psi.device)
-
-    beta = torch.linalg.solve(
-        Psi.T @ Psi + lam * I,
-        Psi.T @ F_star
-    )
+    beta = torch.linalg.lstsq(
+        Psi,
+        F_star,
+        driver="gels",
+    ).solution
 
     # Reconstruct displacement estimate:
     # u_hat = K @ beta
