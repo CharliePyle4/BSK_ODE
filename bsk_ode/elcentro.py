@@ -123,7 +123,7 @@ def build_kernel_from_different_signatures(
 def normalize_signatures(Z: torch.Tensor,
                              depth: int,
                              dim: int,
-                             eps: float = 1e-8,
+                             eps: float = 1e-3,
                              **kwargs) -> torch.Tensor:
     """
     Column-wise robust normalization using median and IQR.
@@ -154,7 +154,7 @@ def apply_signature_normalization_pair(
     Returns:
         (sigs_train_norm, sigs_full_norm)
     """
-    eps = kwargs.get("eps", 1e-8)
+    eps = kwargs.get("eps", 1e-3)
 
     # Compute robust column-wise stats on the *training* signatures
     med = sigs_train.median(dim=0, keepdim=True).values
