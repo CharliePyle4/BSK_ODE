@@ -418,10 +418,10 @@ def run_full_batch(
 
 def print_error_summary(
     label:        str,
-    F_pred,       # numpy or torch
-    F_true,       # numpy or torch
-    y_pred,       # numpy or torch
-    y_true,       # numpy or torch
+    F_pred,       # numpy or torch or list
+    F_true,       # numpy or torch or list
+    y_pred,       # numpy or torch or list
+    y_true,       # numpy or torch or list
     idx_train,
     idx_test,
     idx_full,
@@ -454,8 +454,20 @@ def print_error_summary(
         if prev_section is not None and section != prev_section:
             print(f"{'-' * 86}")
         prev_section = section
-        mse_val     = mse_fn(pred[idx], true[idx])
-        rel_mse_val = rel_mse_fn(pred[idx], true[idx])
+
+        if use_torch:
+            pred_arr = pred if isinstance(pred, torch.Tensor) else torch.tensor(pred, dtype=torch.float64)
+            true_arr = true if isinstance(true, torch.Tensor) else torch.tensor(true, dtype=torch.float64)
+            idx_t    = torch.as_tensor(idx, dtype=torch.long)
+            mse_val     = mse_fn(pred_arr[idx_t], true_arr[idx_t])
+            rel_mse_val = rel_mse_fn(pred_arr[idx_t], true_arr[idx_t])
+        else:
+            pred_arr = np.asarray(pred)
+            true_arr = np.asarray(true)
+            idx_np   = np.asarray(idx, dtype=int)
+            mse_val     = mse_fn(pred_arr[idx_np], true_arr[idx_np])
+            rel_mse_val = rel_mse_fn(pred_arr[idx_np], true_arr[idx_np])
+
         print(f"{name:25s} {mse_val:>18.6e} {rel_mse_val:>18.6e} {100 * rel_mse_val:>19.4f}%")
 
     print(f"{'=' * 86}")
