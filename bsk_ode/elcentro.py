@@ -285,11 +285,10 @@ def solvebetas1(
     rcond = torch.finfo(dtype).eps
 
     beta = torch.linalg.lstsq(
-        Psi.cpu(),
-        F_star.cpu(),
-        rcond=rcond,
+        Psi,
+        F_star,
         driver="gels",
-    ).solution.to(device)
+    ).solution
 
     # Reconstruct displacement estimate:
     # u_hat = K @ beta
