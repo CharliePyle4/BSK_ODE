@@ -246,26 +246,27 @@ def build_rhs(f: torch.Tensor, x: torch.Tensor,
 
 #     return beta, u, rhs_pred, rhs
 
-# def evaluate_solution_from_beta(
-#     K0: torch.Tensor,
-#     IK: torch.Tensor,
-#     I2K: torch.Tensor,
-#     x: torch.Tensor,
-#     beta: torch.Tensor,
-#     ua: float,
-#     upa: float,
-# ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-#     """
-#     Given kernel operators K0, IK, I2K and coefficients beta,
-#     reconstruct u, Iu, I^2 u on the grid x for method 2.
-#     """
+def evaluate_solution_from_beta(
+    K0: torch.Tensor,
+    IK: torch.Tensor,
+    I2K: torch.Tensor,
+    x: torch.Tensor,
+    beta: torch.Tensor,
+    ua: float,
+    upa: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Given kernel operators K0, IK, I2K and coefficients beta,
+    reconstruct u, Iu, I^2 u on the grid x for method 2.
+    """
 
-#     u   = K0  @ beta   # u      ~ K0  beta  (same as in solvebetasmethod2)
-#     Iu  = IK  @ beta   # ∫u     ~ IK  beta
-#     I2u = I2K @ beta   # ∫∫u    ~ I2K beta
+    u   = K0  @ beta   # u      ~ K0  beta  (same as in solvebetasmethod2)
+    Iu  = IK  @ beta   # ∫u     ~ IK  beta
+    I2u = I2K @ beta   # ∫∫u    ~ I2K beta
 
-#     # Maintain the output order expected by the test code:
-#     return u, Iu, I2u
+    # Maintain the output order expected by the test code:
+    return u, Iu, I2u
+
 def solvebetas(
     Ksig: torch.Tensor,
     f: torch.Tensor,
@@ -376,28 +377,6 @@ def solvebetas(
     )
 
     return beta, u, rhs_pred, F_star
-
-
-def evaluate_solution_from_beta(
-    K0: torch.Tensor,
-    IK: torch.Tensor,
-    I2K: torch.Tensor,
-    x: torch.Tensor,
-    beta: torch.Tensor,
-    ua: float,
-    upa: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Given kernel operators K0, IK, I2K and coefficients beta,
-    reconstruct u, Iu, I^2 u on the grid x for method 2.
-    """
-
-    u   = K0  @ beta   # u      ~ K0  beta  (same as in solvebetasmethod2)
-    Iu  = IK  @ beta   # ∫u     ~ IK  beta
-    I2u = I2K @ beta   # ∫∫u    ~ I2K beta
-
-    # Maintain the output order expected by the test code:
-    return u, Iu, I2u
 
 
 def evaluate_forcing_from_solution(
