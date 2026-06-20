@@ -202,7 +202,7 @@ def solvebetas(
     k1: float,
     k2: float,
     k3: float,
-    reg: float = 1e-10,
+    reg: float = 1e-5,
 ):
     dtype = torch.float64
     device = Ksig.device
@@ -223,7 +223,7 @@ def solvebetas(
 
     # Ridge regression:
     # beta = argmin ||A beta - rhs||^2 + reg ||beta||^2
-    lam = max(float(reg), 1e-2)
+    lam = max(float(reg), 1e-5)
 
     p = A.shape[1]
     Ireg = torch.eye(p, dtype=dtype, device=device)
