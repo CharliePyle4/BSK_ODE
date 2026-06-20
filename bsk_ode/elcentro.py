@@ -231,7 +231,7 @@ def solvebetas(
     lhs = A.T @ A + lam * Ireg
     rhs_ridge = A.T @ rhs
 
-    beta = torch.linalg.lstsq(lhs, rhs_ridge)
+    beta = torch.linalg.solve(lhs, rhs_ridge)
 
     if not torch.isfinite(beta).all():
         raise ValueError(
