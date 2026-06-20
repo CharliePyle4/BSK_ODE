@@ -193,38 +193,6 @@ def build_rhs(f: torch.Tensor, x: torch.Tensor,
     q = k1 * ua + (k1 * upa + k2 * ua) * (x - x0)
     return double_integrate(f, x) + q
 
-# def solvebetas(Ksig: torch.Tensor,
-#                       f: torch.Tensor,
-#                       x: torch.Tensor,
-#                       ua: float,
-#                       upa: float,
-#                       k1: float,
-#                       k2: float,
-#                       k3: float,
-#                       reg: float = 1e-10):
-#     dtype = torch.float64
-#     device = Ksig.device
-
-#     Ksig = Ksig.to(device=device, dtype=dtype)
-#     x = x.to(device=device, dtype=dtype)
-#     f = f.to(device=device, dtype=dtype)
-
-#     K0, IK, I2K = buildkerneloperators(Ksig, x)
-
-#     A = k1 * K0 + k2 * IK + k3 * I2K
-#     rhs = build_rhs(f, x, ua, upa, k1, k2).to(device=device, dtype=dtype)
-
-#     N = Ksig.shape[0]
-#     Ireg = torch.eye(N, dtype=dtype, device=device)
-#     rcond = torch.finfo(torch.float64).eps
-#     beta = torch.linalg.lstsq(A, rhs,rcond = rcond, driver = 'gels').solution
-#     #A = torch.linalg.lstsq(Psi, F_star, rcond=rcond, driver='gelsd').solution
-#     u = K0 @ beta
-#     Iu = IK @ beta
-#     I2u = I2K @ beta
-#     rhs_pred = k1 * u + k2 * Iu + k3 * I2u
-
-#     return beta, u, rhs_pred, rhs
 def solvebetas(
     Ksig: torch.Tensor,
     f: torch.Tensor,
@@ -234,91 +202,49 @@ def solvebetas(
     k1: float,
     k2: float,
     k3: float,
-    reg: float = 0.0,          # kept for API compatibility; not used here
-    rcond: float | None = None,
+    reg: float = 1e-10,
 ):
-    """
-    GPU-compatible approximation of CPU lstsq(..., driver='gelsd').
-
-    Solves Psi @ beta ~= F_star using a truncated SVD pseudoinverse:
-        beta = V @ diag(1 / S_kept) @ U.T @ F_star
-
-    Singular values <= rcond * largest_singular_value are discarded.
-    """
-
     dtype = torch.float64
     device = Ksig.device
 
     Ksig = Ksig.to(device=device, dtype=dtype)
-    x = x.to(device=device, dtype=dtype).flatten()
-    f = f.to(device=device, dtype=dtype).flatten()
+    x = x.to(device=device, dtype=dtype)
+    f = f.to(device=device, dtype=dtype)
 
-    # K0 = K, IK = K1, I2K = K2
     K0, IK, I2K = buildkerneloperators(Ksig, x)
 
-    # Psi = m*K + c*K1 + k*K2
-    Psi = k1 * K0 + k2 * IK + k3 * I2K
+    # Design/operator matrix
+    A = k1 * K0 + k2 * IK + k3 * I2K
 
-    # F_star = double trapezoidal integral of forcing
-    dt = x[1] - x[0]
-    F_star = trapezoidal_cols(
-        trapezoidal_cols(f, dt),
-        dt,
-    )
+    # Target
+    rhs = build_rhs(
+        f, x, ua, upa, k1, k2
+    ).to(device=device, dtype=dtype)
 
-    if ua != 0.0 or upa != 0.0:
-        print(
-            "Warning: this version matches the zero-initial-condition "
-            "notebook formulation and ignores nonzero ua / upa."
-        )
+    # Ridge regression:
+    # beta = argmin ||A beta - rhs||^2 + reg ||beta||^2
+    lam = max(float(reg), 1e-2)
 
-    if not torch.isfinite(Psi).all():
-        raise ValueError("Psi contains NaN or Inf before SVD.")
+    p = A.shape[1]
+    Ireg = torch.eye(p, dtype=dtype, device=device)
 
-    if not torch.isfinite(F_star).all():
-        raise ValueError("F_star contains NaN or Inf before SVD.")
+    lhs = A.T @ A + lam * Ireg
+    rhs_ridge = A.T @ rhs
 
-    # Match PyTorch's default-style scale reasonably closely:
-    # machine epsilon * max(m, n)
-    if rcond is None:
-        rcond = torch.finfo(dtype).eps * max(Psi.shape)
-
-    # CUDA SVD: works on the T4.
-    # full_matrices=False is important to avoid unnecessary memory use.
-    U, S, Vh = torch.linalg.svd(Psi, full_matrices=False)
-
-    cutoff = rcond * S[0]
-    keep = S > cutoff
-
-    # Truncated-SVD pseudoinverse solve.
-    # Equivalent in spirit to gelsd's rank-truncated least squares.
-    Ut_b = U.transpose(-2, -1) @ F_star
-
-    Sinv = torch.zeros_like(S)
-    Sinv[keep] = 1.0 / S[keep]
-
-    beta = Vh.transpose(-2, -1) @ (Sinv * Ut_b)
+    beta = torch.linalg.solve(lhs, rhs_ridge)
 
     if not torch.isfinite(beta).all():
         raise ValueError(
-            f"beta contains NaN/Inf after GPU SVD solve. "
-            f"Try a larger rcond. Current rcond={rcond:.3e}"
+            f"Non-finite beta after ridge solve. Increase reg; current reg={lam}"
         )
 
     u = K0 @ beta
     Iu = IK @ beta
     I2u = I2K @ beta
 
-    # This is the model-implied F_star prediction.
     rhs_pred = k1 * u + k2 * Iu + k3 * I2u
 
-    print(
-        f"GPU SVD solve | device={device} | "
-        f"effective rank={keep.sum().item()}/{len(S)} | "
-        f"rcond={rcond:.3e} | cutoff={cutoff.item():.3e}"
-    )
-
-    return beta, u, rhs_pred, F_star
+    return beta, u, rhs_pred, rhs
 
 
 def evaluate_solution_from_beta(
