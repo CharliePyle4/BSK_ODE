@@ -287,7 +287,7 @@ def solvebetas(
     beta = torch.linalg.lstsq(
         Psi,
         F_star,
-        driver="gelsd",
+        driver="gels",
     ).solution
 
     # Reconstruct displacement estimate:
