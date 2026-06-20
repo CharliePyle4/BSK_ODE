@@ -225,7 +225,6 @@ def build_rhs(f: torch.Tensor, x: torch.Tensor,
 #     rhs_pred = k1 * u + k2 * Iu + k3 * I2u
 
 #     return beta, u, rhs_pred, rhs
-
 def solvebetas(
     Ksig: torch.Tensor,
     f: torch.Tensor,
@@ -235,18 +234,16 @@ def solvebetas(
     k1: float,
     k2: float,
     k3: float,
-    reg: float = 0.0,
+    reg: float = 0.0,          # kept for API compatibility; not used here
+    rcond: float | None = None,
 ):
     """
-    Solve the same system as the standalone El Centro notebook:
+    GPU-compatible approximation of CPU lstsq(..., driver='gelsd').
 
-        Psi @ beta ~= F_star
+    Solves Psi @ beta ~= F_star using a truncated SVD pseudoinverse:
+        beta = V @ diag(1 / S_kept) @ U.T @ F_star
 
-    where:
-        Psi   = k1*K + k2*K1 + k3*K2
-        F_star = double cumulative trapezoidal integral of f
-
-    Assumes ua = 0 and upa = 0, matching the notebook.
+    Singular values <= rcond * largest_singular_value are discarded.
     """
 
     dtype = torch.float64
@@ -256,49 +253,70 @@ def solvebetas(
     x = x.to(device=device, dtype=dtype).flatten()
     f = f.to(device=device, dtype=dtype).flatten()
 
-    # This should produce:
-    # K0  = K
-    # IK  = K1
-    # I2K = K2
+    # K0 = K, IK = K1, I2K = K2
     K0, IK, I2K = buildkerneloperators(Ksig, x)
 
-    # Equivalent to:
     # Psi = m*K + c*K1 + k*K2
     Psi = k1 * K0 + k2 * IK + k3 * I2K
 
-    # Equivalent to your notebook:
-    # dt = t_vals[1] - t_vals[0]
-    # F_star = trapezoidal_cols(trapezoidal_cols(F_vals, dt), dt)
+    # F_star = double trapezoidal integral of forcing
     dt = x[1] - x[0]
     F_star = trapezoidal_cols(
         trapezoidal_cols(f, dt),
         dt,
     )
 
-    # Your standalone notebook assumes ua = upa = 0.
     if ua != 0.0 or upa != 0.0:
         print(
-            "Warning: this version matches the notebook formulation and "
-            "does not incorporate nonzero ua or upa."
+            "Warning: this version matches the zero-initial-condition "
+            "notebook formulation and ignores nonzero ua / upa."
         )
 
-    rcond = torch.finfo(dtype).eps
+    if not torch.isfinite(Psi).all():
+        raise ValueError("Psi contains NaN or Inf before SVD.")
 
-    beta = torch.linalg.lstsq(
-        Psi,
-        F_star,
-        driver="gels",
-    ).solution
+    if not torch.isfinite(F_star).all():
+        raise ValueError("F_star contains NaN or Inf before SVD.")
 
-    # Reconstruct displacement estimate:
-    # u_hat = K @ beta
+    # Match PyTorch's default-style scale reasonably closely:
+    # machine epsilon * max(m, n)
+    if rcond is None:
+        rcond = torch.finfo(dtype).eps * max(Psi.shape)
+
+    # CUDA SVD: works on the T4.
+    # full_matrices=False is important to avoid unnecessary memory use.
+    U, S, Vh = torch.linalg.svd(Psi, full_matrices=False)
+
+    cutoff = rcond * S[0]
+    keep = S > cutoff
+
+    # Truncated-SVD pseudoinverse solve.
+    # Equivalent in spirit to gelsd's rank-truncated least squares.
+    Ut_b = U.transpose(-2, -1) @ F_star
+
+    Sinv = torch.zeros_like(S)
+    Sinv[keep] = 1.0 / S[keep]
+
+    beta = Vh.transpose(-2, -1) @ (Sinv * Ut_b)
+
+    if not torch.isfinite(beta).all():
+        raise ValueError(
+            f"beta contains NaN/Inf after GPU SVD solve. "
+            f"Try a larger rcond. Current rcond={rcond:.3e}"
+        )
+
     u = K0 @ beta
-
-    # Reconstruct the model-implied double-integrated forcing:
     Iu = IK @ beta
     I2u = I2K @ beta
 
+    # This is the model-implied F_star prediction.
     rhs_pred = k1 * u + k2 * Iu + k3 * I2u
+
+    print(
+        f"GPU SVD solve | device={device} | "
+        f"effective rank={keep.sum().item()}/{len(S)} | "
+        f"rcond={rcond:.3e} | cutoff={cutoff.item():.3e}"
+    )
 
     return beta, u, rhs_pred, F_star
 
