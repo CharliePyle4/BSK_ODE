@@ -193,6 +193,59 @@ def build_rhs(f: torch.Tensor, x: torch.Tensor,
     q = k1 * ua + (k1 * upa + k2 * ua) * (x - x0)
     return double_integrate(f, x) + q
 
+# def solvebetas(
+#     Ksig: torch.Tensor,
+#     f: torch.Tensor,
+#     x: torch.Tensor,
+#     ua: float,
+#     upa: float,
+#     k1: float,
+#     k2: float,
+#     k3: float,
+#     reg: float = 1e-10,
+# ):
+#     dtype = torch.float64
+#     device = Ksig.device
+
+#     Ksig = Ksig.to(device=device, dtype=dtype)
+#     x = x.to(device=device, dtype=dtype)
+#     f = f.to(device=device, dtype=dtype)
+
+#     K0, IK, I2K = buildkerneloperators(Ksig, x)
+
+#     # Design/operator matrix
+#     A = k1 * K0 + k2 * IK + k3 * I2K
+
+#     # Target
+#     rhs = build_rhs(
+#         f, x, ua, upa, k1, k2
+#     ).to(device=device, dtype=dtype)
+
+#     # Ridge regression:
+#     # beta = argmin ||A beta - rhs||^2 + reg ||beta||^2
+#     lam = max(float(reg), 1e-2)
+
+#     p = A.shape[1]
+#     Ireg = torch.eye(p, dtype=dtype, device=device)
+
+#     lhs = A.T @ A + lam * Ireg
+#     rhs_ridge = A.T @ rhs
+
+#     beta = torch.linalg.solve(lhs, rhs_ridge)
+
+#     if not torch.isfinite(beta).all():
+#         raise ValueError(
+#             f"Non-finite beta after ridge solve. Increase reg; current reg={lam}"
+#         )
+
+#     u = K0 @ beta
+#     Iu = IK @ beta
+#     I2u = I2K @ beta
+
+#     rhs_pred = k1 * u + k2 * Iu + k3 * I2u
+
+#     return beta, u, rhs_pred, rhs
+
 def solvebetas(
     Ksig: torch.Tensor,
     f: torch.Tensor,
@@ -202,50 +255,107 @@ def solvebetas(
     k1: float,
     k2: float,
     k3: float,
-    reg: float = 1e-10,
+    reg: float = 1e-10,   # kept only so the rest of your code still works
 ):
+    """
+    GPU/T4 version of:
+
+        beta = torch.linalg.lstsq(
+            Psi,
+            F_star,
+            rcond=torch.finfo(torch.float64).eps,
+            driver="gelsd"
+        ).solution
+
+    using a truncated SVD pseudoinverse directly on CUDA.
+    """
+
     dtype = torch.float64
     device = Ksig.device
 
     Ksig = Ksig.to(device=device, dtype=dtype)
-    x = x.to(device=device, dtype=dtype)
-    f = f.to(device=device, dtype=dtype)
+    x = x.to(device=device, dtype=dtype).flatten()
+    f = f.to(device=device, dtype=dtype).flatten()
 
-    K0, IK, I2K = buildkerneloperators(Ksig, x)
+    # Match your standalone notebook exactly:
+    #
+    # K  = S @ S.T
+    # K1 = trapezoidal_cols(K, dt)
+    # K2 = trapezoidal_cols(K1, dt)
+    #
+    dt = x[1] - x[0]
 
-    # Design/operator matrix
-    A = k1 * K0 + k2 * IK + k3 * I2K
+    K0 = Ksig
+    IK = trapezoidal_cols(K0, dt)
+    I2K = trapezoidal_cols(IK, dt)
 
-    # Target
-    rhs = build_rhs(
-        f, x, ua, upa, k1, k2
-    ).to(device=device, dtype=dtype)
+    # Same as:
+    # Psi = m * K + c * K1 + k * K2
+    Psi = k1 * K0 + k2 * IK + k3 * I2K
 
-    # Ridge regression:
-    # beta = argmin ||A beta - rhs||^2 + reg ||beta||^2
-    lam = max(float(reg), 1e-2)
+    # Same as:
+    # F_star = trapezoidal_cols(trapezoidal_cols(F_vals, dt), dt)
+    F_star = trapezoidal_cols(
+        trapezoidal_cols(f, dt),
+        dt,
+    )
 
-    p = A.shape[1]
-    Ireg = torch.eye(p, dtype=dtype, device=device)
+    # Your standalone code assumes zero initial conditions.
+    if ua != 0.0 or upa != 0.0:
+        print(
+            "Warning: this GPU SVD version matches the standalone notebook "
+            "and ignores nonzero ua / upa."
+        )
 
-    lhs = A.T @ A + lam * Ireg
-    rhs_ridge = A.T @ rhs
+    if not torch.isfinite(Psi).all():
+        raise ValueError("Psi contains NaN or Inf before SVD.")
 
-    beta = torch.linalg.solve(lhs, rhs_ridge)
+    if not torch.isfinite(F_star).all():
+        raise ValueError("F_star contains NaN or Inf before SVD.")
+
+    # Same cutoff idea as:
+    # rcond = torch.finfo(torch.float64).eps
+    rcond = torch.finfo(dtype).eps
+
+    # GPU SVD. This genuinely runs on the T4 if Psi is on cuda:0.
+    U, S, Vh = torch.linalg.svd(Psi, full_matrices=False)
+
+    # Same logic as gelsd:
+    # discard singular-value directions that are numerically zero.
+    cutoff = rcond * S[0]
+    keep = S > cutoff
+
+    S_inv = torch.zeros_like(S)
+    S_inv[keep] = 1.0 / S[keep]
+
+    # Equivalent to:
+    # beta = pinv(Psi) @ F_star
+    beta = Vh.transpose(-2, -1) @ (
+        S_inv * (U.transpose(-2, -1) @ F_star)
+    )
 
     if not torch.isfinite(beta).all():
         raise ValueError(
-            f"Non-finite beta after ridge solve. Increase reg; current reg={lam}"
+            "beta contains NaN/Inf after GPU truncated-SVD solve. "
+            "Use a larger singular-value cutoff."
         )
 
+    # Same reconstruction logic as before
     u = K0 @ beta
     Iu = IK @ beta
     I2u = I2K @ beta
 
+    # This is Psi @ beta, the prediction of F_star
     rhs_pred = k1 * u + k2 * Iu + k3 * I2u
 
-    return beta, u, rhs_pred, rhs
+    print(
+        f"GPU SVD | device={Psi.device} | "
+        f"rank={keep.sum().item()}/{len(S)} | "
+        f"rcond={rcond:.3e} | "
+        f"cutoff={cutoff.item():.3e}"
+    )
 
+    return beta, u, rhs_pred, F_star
 
 def evaluate_solution_from_beta(
     K0: torch.Tensor,
