@@ -226,6 +226,84 @@ def solvebetas(Ksig: torch.Tensor,
 
     return beta, u, rhs_pred, rhs
 
+def solvebetas1(
+    Ksig: torch.Tensor,
+    f: torch.Tensor,
+    x: torch.Tensor,
+    ua: float,
+    upa: float,
+    k1: float,
+    k2: float,
+    k3: float,
+    reg: float = 0.0,
+):
+    """
+    Solve the same system as the standalone El Centro notebook:
+
+        Psi @ beta ~= F_star
+
+    where:
+        Psi   = k1*K + k2*K1 + k3*K2
+        F_star = double cumulative trapezoidal integral of f
+
+    Assumes ua = 0 and upa = 0, matching the notebook.
+    """
+
+    dtype = torch.float64
+    device = Ksig.device
+
+    Ksig = Ksig.to(device=device, dtype=dtype)
+    x = x.to(device=device, dtype=dtype).flatten()
+    f = f.to(device=device, dtype=dtype).flatten()
+
+    # This should produce:
+    # K0  = K
+    # IK  = K1
+    # I2K = K2
+    K0, IK, I2K = buildkerneloperators(Ksig, x)
+
+    # Equivalent to:
+    # Psi = m*K + c*K1 + k*K2
+    Psi = k1 * K0 + k2 * IK + k3 * I2K
+
+    # Equivalent to your notebook:
+    # dt = t_vals[1] - t_vals[0]
+    # F_star = trapezoidal_cols(trapezoidal_cols(F_vals, dt), dt)
+    dt = x[1] - x[0]
+    F_star = trapezoidal_cols(
+        trapezoidal_cols(f, dt),
+        dt,
+    )
+
+    # Your standalone notebook assumes ua = upa = 0.
+    if ua != 0.0 or upa != 0.0:
+        print(
+            "Warning: this version matches the notebook formulation and "
+            "does not incorporate nonzero ua or upa."
+        )
+
+    rcond = torch.finfo(dtype).eps
+
+    beta = torch.linalg.lstsq(
+        Psi.cpu(),
+        F_star.cpu(),
+        rcond=rcond,
+        driver="gelsd",
+    ).solution.to(device)
+
+    # Reconstruct displacement estimate:
+    # u_hat = K @ beta
+    u = K0 @ beta
+
+    # Reconstruct the model-implied double-integrated forcing:
+    Iu = IK @ beta
+    I2u = I2K @ beta
+
+    rhs_pred = k1 * u + k2 * Iu + k3 * I2u
+
+    return beta, u, rhs_pred, F_star
+
+
 def evaluate_solution_from_beta(
     K0: torch.Tensor,
     IK: torch.Tensor,
