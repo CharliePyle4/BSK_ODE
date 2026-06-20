@@ -426,18 +426,15 @@ def run_full_batch(
 
 def print_error_summary(
     label:        str,
-    F_pred,       # numpy or torch or list
-    F_true,       # numpy or torch or list
-    y_pred,       # numpy or torch or list
-    y_true,       # numpy or torch or list
+    F_pred,
+    F_true,
+    y_pred,
+    y_true,
     idx_train,
     idx_test,
     idx_full,
     use_torch: bool = True,
 ):
-    """
-    Print a 3-row (train / test / full) MSE table for forcing and solution.
-    """
     mse_fn     = mse_torch     if use_torch else mse_np
     rel_mse_fn = rel_mse_torch if use_torch else rel_mse_np
 
@@ -464,9 +461,12 @@ def print_error_summary(
         prev_section = section
 
         if use_torch:
-            pred_arr = pred if isinstance(pred, torch.Tensor) else torch.tensor(pred, dtype=torch.float64)
-            true_arr = true if isinstance(true, torch.Tensor) else torch.tensor(true, dtype=torch.float64)
-            idx_t    = torch.as_tensor(idx, dtype=torch.long)
+            # Move both to CPU and float64 for metrics
+            pred_arr = (pred if isinstance(pred, torch.Tensor)
+                        else torch.tensor(pred, dtype=torch.float64)).to("cpu", dtype=torch.float64)
+            true_arr = (true if isinstance(true, torch.Tensor)
+                        else torch.tensor(true, dtype=torch.float64)).to("cpu", dtype=torch.float64)
+            idx_t = torch.as_tensor(idx, dtype=torch.long, device="cpu")
             mse_val     = mse_fn(pred_arr[idx_t], true_arr[idx_t])
             rel_mse_val = rel_mse_fn(pred_arr[idx_t], true_arr[idx_t])
         else:
@@ -479,7 +479,7 @@ def print_error_summary(
         print(f"{name:25s} {mse_val:>18.6e} {rel_mse_val:>18.6e} {100 * rel_mse_val:>19.4f}%")
 
     print(f"{'=' * 86}")
-
+    
 def plot_rolling_results(
     t_vals:          torch.Tensor,
     n0:              int,
