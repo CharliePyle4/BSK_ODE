@@ -191,7 +191,6 @@ def build_state_nonbranched(paths_nb, n0, signature_level, lambda_econ, dt, t_va
         Psi0,
         F_star_torch[:n0 + 1],
         rcond=rcond,
-        driver="gelsd"
     ).solution
 
     F_pred_train = Psi0 @ alpha0
