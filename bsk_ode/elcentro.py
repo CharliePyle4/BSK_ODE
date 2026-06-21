@@ -685,9 +685,9 @@ def robust_apply(x: torch.Tensor, med: torch.Tensor, iqr: torch.Tensor) -> torch
 
 
 # -------------------------------------------------------
-# old Rolling online prediction functions
+# Rolling online prediction functions
 # -------------------------------------------------------
-'''
+
 def build_paths(F_t: pd.DataFrame,
                 num_partitions: int,
                 t_lift_exp: float = 0.3):
@@ -756,10 +756,13 @@ def build_state(paths,
 
     Psi0 = m * K0 + c * K1_0 + k * K2_0
 
-    rcond = torch.finfo(torch.float64).eps
-    alpha0 = torch.linalg.lstsq(
-        Psi0, F_star[:n0 + 1], rcond=rcond, driver="gelsd"
-    ).solution
+    # Ridge-regularized solve (replaces gelsd which is CPU-only)
+    T   = Psi0.shape[0]
+    lam = max(1e-10, float(torch.finfo(torch.float64).eps) * float(Psi0.diagonal().abs().mean()))
+    alpha0 = torch.linalg.solve(
+        Psi0 + lam * torch.eye(T, dtype=torch.float64, device=device),
+        F_star[:n0 + 1],
+    )
 
     F_pred_train = Psi0 @ alpha0
     u_pred_train = K0  @ alpha0
@@ -767,7 +770,7 @@ def build_state(paths,
     return {
         "m": m, "c": c, "k": k,
         "dt": dt, "n0": n0, "N": N,
-        "paths": paths,                     # lists of tensors; signature_of_path handles device
+        "paths": paths,
         "signature_level": signature_level,
         "med": med, "iqr": iqr,
         "F_star": F_star,
@@ -797,19 +800,20 @@ def rolling_online_predict(state: dict,
     depth = state["signature_level"]
     med, iqr = state["med"], state["iqr"]
     F_star   = state["F_star"]
+    dev      = F_star.device
 
     end_idx = N - 1 if max_steps is None else min(N - 1, n0 + max_steps)
 
     S_hist = state["S_hist"].clone()
-    alphas = torch.zeros(end_idx + 1, dtype=torch.float64)
+    alphas = torch.zeros(end_idx + 1, dtype=torch.float64, device=dev)
     alphas[:n0 + 1] = state["alpha0"]
 
     K_prev = state["K_prev"].clone()
     I1 = state["I1"].clone()
     I2 = state["I2"].clone()
 
-    F_pred = torch.zeros(end_idx + 1, dtype=torch.float64)
-    u_pred = torch.zeros(end_idx + 1, dtype=torch.float64)
+    F_pred = torch.zeros(end_idx + 1, dtype=torch.float64, device=dev)
+    u_pred = torch.zeros(end_idx + 1, dtype=torch.float64, device=dev)
 
     F_pred[:n0 + 1] = state["F_pred_train"]
     u_pred[:n0 + 1] = state["u_pred_train"]
@@ -829,13 +833,13 @@ def rolling_online_predict(state: dict,
         I1, I2 = I1_new, I2_new
         K_prev = k_row_old
 
-        col_i   = torch.cat([k_row_old, torch.tensor([k_ii], dtype=torch.float64)])
+        col_i   = torch.cat([k_row_old, torch.tensor([k_ii], dtype=torch.float64, device=dev)])
         inner_i = trapezoidal_cols(col_i, dt)
         outer_i = trapezoidal_cols(inner_i, dt)
 
-        I1 = torch.cat([I1, torch.tensor([float(inner_i[-1])], dtype=torch.float64)])
-        I2 = torch.cat([I2, torch.tensor([float(outer_i[-1])], dtype=torch.float64)])
-        K_prev = torch.cat([K_prev, torch.tensor([k_ii], dtype=torch.float64)])
+        I1 = torch.cat([I1, torch.tensor([float(inner_i[-1])], dtype=torch.float64, device=dev)])
+        I2 = torch.cat([I2, torch.tensor([float(outer_i[-1])], dtype=torch.float64, device=dev)])
+        K_prev = torch.cat([K_prev, torch.tensor([k_ii], dtype=torch.float64, device=dev)])
 
         psi_row_old = m * k_row_old + c * I1[:i] + k * I2[:i]
         psi_diag    = m * k_ii + c * float(I1[i]) + k * float(I2[i])
@@ -860,7 +864,7 @@ def rolling_online_predict(state: dict,
             F_bl   = F_star[:i + 1]
 
             lam    = 1e-13 * torch.mean(torch.diag(Psi_bl))
-            I_mat  = torch.eye(i + 1, dtype=torch.float64)
+            I_mat  = torch.eye(i + 1, dtype=torch.float64, device=dev)
             alphas[:i + 1] = torch.linalg.solve(Psi_bl + lam * I_mat, F_bl)
 
             F_pred[:i + 1] = Psi_bl @ alphas[:i + 1]
@@ -872,7 +876,6 @@ def rolling_online_predict(state: dict,
         "retrain_indices": retrain_indices,
         "end_idx": end_idx,
     }
-'''
 
 def rolling_update_step(
     beta_prev: torch.Tensor,
