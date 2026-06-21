@@ -537,7 +537,8 @@ def predict_signature_kernel(
         Ksig_eval_train = build_kernel_from_different_signatures(
             X_sig_eval, X_sig_train
         )
-        Ku2_eval, Kup_eval, Ku_eval = buildkerneloperators(
+
+        Ku_eval, Kup_eval, Ku2_eval = buildkerneloperators(
             Ksig_eval_train, x_eval
         )
 
