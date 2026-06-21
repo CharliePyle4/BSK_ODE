@@ -967,15 +967,20 @@ def solve_signature_kernel_rolling_retrain(
     normalize: bool = True,
     reg: float = 1e-10,
     retrain_every: int = 10,
+    n0: int = 200,
     use_tlift: bool = False,
     holder_value=None,
 ):
     """
     Rolling retrain using partition prefix paths + incremental Gauss-Seidel update.
 
-    Internally uses build_state + rolling_online_predict.
+    n0 controls the initial training window size (number of points used for the
+    first solve). Rolling prediction then runs from n0+1 through all N points.
+    This matches the reference implementation where n0=200 is independent of
+    the train/test split.
+
     normalize/reg/ua/upa are accepted for API compatibility; normalization is
-    always applied via robust_fit/robust_apply (same as the reference implementation).
+    always applied via robust_fit/robust_apply.
     """
     if use_tlift and holder_value is None:
         raise ValueError("holder_value must be provided when use_tlift=True")
@@ -984,8 +989,10 @@ def solve_signature_kernel_rolling_retrain(
         t_all = torch.cat([t_train, t_test], dim=0).to(dtype=torch.float64)
         f_all = torch.cat([f_train, f_test], dim=0).to(dtype=torch.float64)
         N  = t_all.numel()
-        n0 = t_train.numel() - 1
         dt = float((t_all[1] - t_all[0]).item())
+
+        if n0 >= N:
+            raise ValueError(f"n0={n0} must be less than total points N={N}")
 
         t_cpu = t_all.cpu()
         f_cpu = f_all.cpu()
@@ -1003,7 +1010,7 @@ def solve_signature_kernel_rolling_retrain(
                 for i in range(N)
             ]
 
-        # Double-integrated forcing — regression target
+        # Double-integrated forcing — regression target over all N points
         F_star = trapezoidal_cols(trapezoidal_cols(f_all.to(device), dt), dt)
 
         state = build_state(
