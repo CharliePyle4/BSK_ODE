@@ -854,7 +854,6 @@ def rolling_online_predict(state: dict,
         S_hist = torch.vstack([S_hist, s_new.unsqueeze(0)])
 
         if (i - n0) % retrain_every == 0:
-            print(f"[Retrain] at index {i}")
             retrain_indices.append(i)
 
             K      = S_hist @ S_hist.T
