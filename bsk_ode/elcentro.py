@@ -942,7 +942,7 @@ def solve_signature_kernel_rolling_retrain(
 
         # Build prefix paths: paths[i] is the path from index 0..i  (shape (i+1, d))
         if use_tlift:
-            lift_cpu = t_cpu ** holder_value
+            lift_cpu = t_cpu ** (2* holder_value)
             paths = [
                 torch.stack([t_cpu[:i+1], f_cpu[:i+1], lift_cpu[:i+1]], dim=1)
                 for i in range(N)
