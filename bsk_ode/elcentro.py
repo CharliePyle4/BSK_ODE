@@ -120,53 +120,6 @@ def build_kernel_from_different_signatures(
     Ker = sigs_flat1 @ sigs_flat2.T
     return Ker
 
-def normalize_signatures(Z: torch.Tensor,
-                             depth: int,
-                             dim: int,
-                             eps: float = 1e-3,
-                             **kwargs) -> torch.Tensor:
-    """
-    Column-wise robust normalization using median and IQR.
-    For each feature j:
-      med_j = median_t Z[t,j]
-      q25_j, q75_j = 25th, 75th percentiles over time
-      iqr_j = q75_j - q25_j
-      Z[:,j] -> (Z[:,j] - med_j) / (iqr_j + eps)
-    """
-    med = Z.median(dim=0, keepdim=True).values      # (1,D)
-    q25 = Z.quantile(0.25, dim=0, keepdim=True)
-    q75 = Z.quantile(0.75, dim=0, keepdim=True)
-    iqr = q75 - q25
-    return (Z - med) / (iqr + eps)
-
-def apply_signature_normalization_pair(
-    sigs_train: torch.Tensor,
-    sigs_full: torch.Tensor,
-    depth: int,
-    dim: int,
-    **kwargs
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Normalize both train and full signatures using training statistics only.
-    Uses the same median/IQR scheme as normalize_signatures, but
-    estimates med/iqr on sigs_train and applies them to both.
-
-    Returns:
-        (sigs_train_norm, sigs_full_norm)
-    """
-    eps = kwargs.get("eps", 1e-3)
-
-    # Compute robust column-wise stats on the *training* signatures
-    med = sigs_train.median(dim=0, keepdim=True).values
-    q25 = sigs_train.quantile(0.25, dim=0, keepdim=True)
-    q75 = sigs_train.quantile(0.75, dim=0, keepdim=True)
-    iqr = q75 - q25
-
-    sigs_train_norm = (sigs_train - med) / (iqr + eps)
-    sigs_full_norm  = (sigs_full  - med) / (iqr + eps)
-
-    return sigs_train_norm, sigs_full_norm
- 
 
 
 def buildkerneloperators(Ksig: torch.Tensor, x: torch.Tensor):
@@ -254,7 +207,7 @@ def evaluate_solution_from_beta(
     beta: torch.Tensor,
     ua: float,
     upa: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Given kernel operators K0, IK, I2K and coefficients beta,
     reconstruct u, Iu, I^2 u on the grid x for method 2.
@@ -448,44 +401,87 @@ def diagnose_conditioning(x, f,
 
         return 
 
+def normalize_signatures(
+    Z: torch.Tensor,
+    depth: int,
+    dim: int,
+    eps: float = 1e-10,
+    return_stats: bool = False,
+    **kwargs,
+):
+    """
+    Column-wise robust normalization using median and IQR.
+
+    If return_stats=False:
+        returns Z_norm
+
+    If return_stats=True:
+        returns Z_norm, med, iqr
+    """
+    med = Z.median(dim=0, keepdim=True).values
+    q25 = Z.quantile(0.25, dim=0, keepdim=True)
+    q75 = Z.quantile(0.75, dim=0, keepdim=True)
+    iqr = q75 - q25
+
+    Z_norm = (Z - med) / (iqr + eps)
+
+    if return_stats:
+        return Z_norm, med, iqr
+    return Z_norm
+
+
+def apply_signature_normalization(
+    Z: torch.Tensor,
+    med: torch.Tensor,
+    iqr: torch.Tensor,
+    eps: float = 1e-3,
+):
+    """
+    Apply precomputed normalization stats to signatures.
+    """
+    return (Z - med) / (iqr + eps)
+
 
 
 def solve_signature_kernel_calibration(x, f,
                         k1, k2, k3,
                         ua, upa,
                         depth,
-                        normalize = True,
-                        reg = 1e-10,
+                        normalize=True,
+                        reg=1e-10,
                         use_tlift=False,
                         holder_value=None):
 
     with torch.no_grad():
-
-        X = torch.stack([x, f], dim=1)           # (T,2)
+        X = torch.stack([x, f], dim=1)
 
         if use_tlift:
-
             if holder_value is None:
                 raise ValueError("holder_value must be provided when use_tlift=True")
             X = tlift(X, holder_value)
 
         X_sig = compute_signatures(X, depth)
 
-        if(normalize == True):
-            X_sig = normalize_signatures(Z=X_sig,depth=depth,dim=X.shape[1],)
+        med, iqr = None, None
+        if normalize:
+            X_sig, med, iqr = normalize_signatures(
+                Z=X_sig,
+                depth=depth,
+                dim=X.shape[1],
+                return_stats=True,
+            )
 
         Ksig = build_kernel_from_signatures(X_sig)
 
         alpha, u, f_pred_final, rhs_true = solvebetas(
             Ksig=Ksig,
-            f=f,x=x,
+            f=f, x=x,
             ua=ua, upa=upa,
-            k1=k1,k2=k2,k3=k3,
-            reg = reg
+            k1=k1, k2=k2, k3=k3,
+            reg=reg
         )
 
-
-    return u, f_pred_final, alpha
+    return u, f_pred_final, alpha, X_sig, med, iqr
 
 def predict_signature_kernel(
     x_train, f_train,
@@ -497,6 +493,9 @@ def predict_signature_kernel(
     normalize=True,
     use_tlift=False,
     holder_value=None,
+    X_sig_train=None,
+    med=None,
+    iqr=None,
 ):
     """
     Predict u and f on x_eval using a model calibrated on (x_train, f_train).
@@ -506,30 +505,27 @@ def predict_signature_kernel(
         if use_tlift and holder_value is None:
             raise ValueError("holder_value must be provided when use_tlift=True")
 
-        # Build training path
-        X_train = torch.stack([x_train, f_train], dim=1)
-        if use_tlift:
-            X_train = tlift(X_train, holder_value)
+        if X_sig_train is None:
+            X_train = torch.stack([x_train, f_train], dim=1)
+            if use_tlift:
+                X_train = tlift(X_train, holder_value)
+            X_sig_train = compute_signatures(X_train, depth)
+            if normalize:
+                X_sig_train = apply_signature_normalization(
+                    X_sig_train, med, iqr
+                )
 
-        # Build evaluation path
         X_eval = torch.stack([x_eval, f_eval], dim=1)
         if use_tlift:
             X_eval = tlift(X_eval, holder_value)
 
-        # Compute raw signatures for both
-        X_sig_train = compute_signatures(X_train, depth)
-        X_sig_eval  = compute_signatures(X_eval, depth)
+        X_sig_eval = compute_signatures(X_eval, depth)
 
-        # Normalize both using training stats only (single consistent normalization)
         if normalize:
-            X_sig_train, X_sig_eval = apply_signature_normalization_pair(
-                X_sig_train,
-                X_sig_eval,
-                depth=depth,
-                dim=X_train.shape[1],
+            X_sig_eval = apply_signature_normalization(
+                X_sig_eval, med, iqr
             )
 
-        # Cross-kernel operators
         Ksig_eval_train = build_kernel_from_different_signatures(
             X_sig_eval, X_sig_train
         )
@@ -538,17 +534,16 @@ def predict_signature_kernel(
             Ksig_eval_train, x_eval
         )
 
-        # Evaluate solution and forcing
-        # Correct operator ordering: K0=u operator, IK=∫u operator, I2K=∫∫u operator
         u_eval, u_p_eval, u_dd_eval = evaluate_solution_from_beta(
             Ku_eval, Kup_eval, Ku2_eval, x_eval, alpha, ua, upa
         )
+
         f_eval_pred = evaluate_forcing_from_solution(
             u_eval, u_p_eval, u_dd_eval, k1, k2, k3
         )
 
     return u_eval, f_eval_pred
-    
+
 def solve_signature_kernel_predict_retrain(
     t_train: torch.Tensor,
     t_test: torch.Tensor,
@@ -571,7 +566,13 @@ def solve_signature_kernel_predict_retrain(
         raise ValueError("holder_value must be provided when use_tlift=True")
 
     with torch.no_grad():
-        u_pred_train, f_pred_train, alpha = solve_signature_kernel_calibration(
+        # --- initial calibration on train ---
+        (u_pred_train,
+         f_pred_train,
+         alpha,
+         X_sig_train,
+         med,
+         iqr) = solve_signature_kernel_calibration(
             x=t_train,
             f=f_train,
             k1=k1, k2=k2, k3=k3,
@@ -589,6 +590,7 @@ def solve_signature_kernel_predict_retrain(
         # Current fitted set starts as the original train set
         t_fit = t_train.clone()
         f_fit = f_train.clone()
+        X_sig_train_fit = X_sig_train.clone()
 
         N_train = t_train.numel()
         N_test = t_test.numel()
@@ -598,7 +600,12 @@ def solve_signature_kernel_predict_retrain(
                 t_fit = torch.cat([t_train, t_test[:j]], dim=0)
                 f_fit = torch.cat([f_train, f_test[:j]], dim=0)
 
-                _, _, alpha = solve_signature_kernel_calibration(
+                (_u_fit,
+                 _f_fit,
+                 alpha,
+                 X_sig_train_fit,
+                 med,
+                 iqr) = solve_signature_kernel_calibration(
                     x=t_fit,
                     f=f_fit,
                     k1=k1, k2=k2, k3=k3,
@@ -625,13 +632,16 @@ def solve_signature_kernel_predict_retrain(
                 normalize=normalize,
                 use_tlift=use_tlift,
                 holder_value=holder_value,
+                X_sig_train=X_sig_train_fit,
+                med=med,
+                iqr=iqr,
             )
 
             u_pred_full = torch.cat(
-                [u_pred_full, u_curr[N_train + j - 1:N_train + j]], dim=0
+                [u_pred_full, u_curr[N_train + j - 1 : N_train + j]], dim=0
             )
             f_pred_full = torch.cat(
-                [f_pred_full, f_curr_pred[N_train + j - 1:N_train + j]], dim=0
+                [f_pred_full, f_curr_pred[N_train + j - 1 : N_train + j]], dim=0
             )
 
     t_all = torch.cat([t_train, t_test], dim=0)
@@ -640,7 +650,6 @@ def solve_signature_kernel_predict_retrain(
     print(f"final forcing loss (train+test, last beta): {final_loss.item():.3e}")
 
     return u_pred_full, f_pred_full
-
 
 
 
@@ -876,84 +885,6 @@ def rolling_online_predict(state: dict,
         "end_idx": end_idx,
     }
 
-def rolling_update_step(
-    beta_prev: torch.Tensor,
-    X_sig_train: torch.Tensor,
-    t_curr: torch.Tensor,
-    f_curr: torch.Tensor,
-    k1: float,
-    k2: float,
-    k3: float,
-    ua: float,
-    upa: float,
-    depth: int,
-    normalize: bool = True,
-    use_tlift: bool = False,
-    holder_value=None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Perform one rolling update step (no full retrain).
-
-    Returns:
-        u_new    : predicted u at t_curr[-1]
-        f_new    : predicted forcing at t_curr[-1]
-        beta_new : updated coefficient vector including alpha_new
-    """
-    if use_tlift and holder_value is None:
-        raise ValueError("holder_value must be provided when use_tlift=True")
-
-    # Build current path and signatures
-    X_curr = torch.stack([t_curr, f_curr], dim=1)
-
-    if use_tlift:
-        X_curr = tlift(X_curr, holder_value)
-
-    X_sig_cur = compute_signatures(X_curr, depth)
-
-    if normalize:
-        _, X_sig_cur = apply_signature_normalization_pair(
-            X_sig_train,
-            X_sig_cur,
-            depth=depth,
-            dim=X_curr.shape[1],
-        )
-
-    # Full kernel on current points
-    Ksig_full = build_kernel_from_signatures(X_sig_cur)
-    K0, I1K, I2K = buildkerneloperators(Ksig_full, t_curr)
-
-    # Row for the new point vs all previous points
-    phi_K0_row = K0[-1, :-1]
-    I1_row = I1K[-1, :-1]
-    I2_row = I2K[-1, :-1]
-
-    # Diagonal entries for the new point
-    k_diag = K0[-1, -1]
-    I1_diag = I1K[-1, -1]
-    I2_diag = I2K[-1, -1]
-
-    # Operator row/diag at the new point
-    phi_row_old = k1 * phi_K0_row + k2 * I1_row + k3 * I2_row
-    phi_diag = k1 * k_diag + k2 * I1_diag + k3 * I2_diag
-
-    # One-step residual update at the new point
-    eps_denom = 1e-12
-    target_new = f_curr[-1]
-    alpha_new = (target_new - torch.dot(phi_row_old, beta_prev)) / (phi_diag + eps_denom)
-
-    # Extend coefficients
-    beta_new = torch.cat([beta_prev, alpha_new.unsqueeze(0)], dim=0)
-
-    # Evaluate full solution/forcing and take last entries
-    u_all, Iu, I2u = evaluate_solution_from_beta(
-        K0, I1K, I2K, t_curr, beta_new, ua, upa
-    )
-    f_pred_all = evaluate_forcing_from_solution(u_all, Iu, I2u, k1, k2, k3)
-
-    u_new = u_all[-1]
-    f_new = f_pred_all[-1]
-
-    return u_new, f_new, beta_new
 
 def solve_signature_kernel_rolling_retrain(
     t_train: torch.Tensor,
