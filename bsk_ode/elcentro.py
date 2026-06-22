@@ -731,7 +731,8 @@ def build_state(paths,
                 dt: float, N: int,
                 F_star: torch.Tensor,
                 t_vals: torch.Tensor,
-                u_true_interp: torch.Tensor) -> dict:
+                u_true_interp: torch.Tensor,
+                reg: float = 1e-10) -> dict:
     """
     Train on the first n0+1 paths and return a state dict
     ready for rolling_online_predict.
@@ -759,7 +760,7 @@ def build_state(paths,
 
     # Ridge-regularized solve (replaces gelsd which is CPU-only)
     T   = Psi0.shape[0]
-    lam = max(1e-10, float(torch.finfo(torch.float64).eps) * float(Psi0.diagonal().abs().mean()))
+    lam = max(float(reg), float(torch.finfo(torch.float64).eps) * float(Psi0.diagonal().abs().mean()))
     alpha0 = torch.linalg.solve(
         Psi0 + lam * torch.eye(T, dtype=torch.float64, device=device),
         F_star[:n0 + 1],
@@ -789,7 +790,8 @@ def build_state(paths,
 
 def rolling_online_predict(state: dict,
                            retrain_every: int = 5,
-                           max_steps: int | None = None) -> dict:
+                           max_steps: int | None = None,
+                           reg: float = 1e-10) -> dict:
     """
     Online sequential prediction with periodic full retraining.
     """
@@ -820,7 +822,7 @@ def rolling_online_predict(state: dict,
     u_pred[:n0 + 1] = state["u_pred_train"]
 
     retrain_indices = []
-    eps = 1e-3
+    eps = 1e-12
 
     for i in range(n0 + 1, end_idx + 1):
         s_raw = signature_of_path(paths[i], depth=depth)
@@ -863,12 +865,13 @@ def rolling_online_predict(state: dict,
             Psi_bl = Psi[:i + 1, :i + 1]
             F_bl   = F_star[:i + 1]
 
-            lam    = 1e-13 * torch.mean(torch.diag(Psi_bl))
+            lam = max(float(reg), float(torch.finfo(torch.float64).eps) * float(Psi_bl.diagonal().abs().mean()))
             I_mat  = torch.eye(i + 1, dtype=torch.float64, device=dev)
             alphas[:i + 1] = torch.linalg.solve(Psi_bl + lam * I_mat, F_bl)
 
-            F_pred[:i + 1] = Psi_bl @ alphas[:i + 1]
-            u_pred[:i + 1] = K[:i + 1, :i + 1] @ alphas[:i + 1]
+            # Do not overwrite historical predictions with the new in-sample fit
+            # F_pred[:i + 1] = Psi_bl @ alphas[:i + 1]
+            # u_pred[:i + 1] = K[:i + 1, :i + 1] @ alphas[:i + 1]
 
     return {
         "F_pred": F_pred,
@@ -1022,9 +1025,10 @@ def solve_signature_kernel_rolling_retrain(
             F_star=F_star,
             t_vals=t_all,
             u_true_interp=torch.zeros(N, dtype=torch.float64),
+            reg=reg,
         )
 
-        res = rolling_online_predict(state, retrain_every=retrain_every)
+        res = rolling_online_predict(state, retrain_every=retrain_every, reg=reg)
 
     u_pred = res["u_pred"]
     F_pred = res["F_pred"]
