@@ -511,22 +511,18 @@ def predict_signature_kernel(
         if use_tlift:
             X_train = tlift(X_train, holder_value)
 
-        X_sig_train = compute_signatures(X_train, depth)
-        if normalize:
-            X_sig_train = normalize_signatures(
-                Z=X_sig_train,
-                depth=depth,
-                dim=X_train.shape[1],
-            )
-
         # Build evaluation path
         X_eval = torch.stack([x_eval, f_eval], dim=1)
         if use_tlift:
             X_eval = tlift(X_eval, holder_value)
 
-        X_sig_eval = compute_signatures(X_eval, depth)
+        # Compute raw signatures for both
+        X_sig_train = compute_signatures(X_train, depth)
+        X_sig_eval  = compute_signatures(X_eval, depth)
+
+        # Normalize both using training stats only (single consistent normalization)
         if normalize:
-            _, X_sig_eval = apply_signature_normalization_pair(
+            X_sig_train, X_sig_eval = apply_signature_normalization_pair(
                 X_sig_train,
                 X_sig_eval,
                 depth=depth,
@@ -552,7 +548,7 @@ def predict_signature_kernel(
         )
 
     return u_eval, f_eval_pred
-
+    
 def solve_signature_kernel_predict_retrain(
     t_train: torch.Tensor,
     t_test: torch.Tensor,
