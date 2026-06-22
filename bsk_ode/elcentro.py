@@ -836,7 +836,8 @@ def rolling_online_predict(state: dict,
 
     for i in range(n0 + 1, end_idx + 1):
         s_raw = signature_of_path(paths[i], depth=depth)
-        s_new = apply_signature_normalization(s_raw, med, iqr, eps=norm_eps)
+        s_new = apply_signature_normalization(s_raw, med, iqr, eps=norm_eps).squeeze(0)
+
 
 
         k_row_old = S_hist @ s_new
@@ -913,7 +914,7 @@ def solve_signature_kernel_rolling_retrain(
     This matches the reference implementation where n0=200 is independent of
     the train/test split.
 
-    n0 is from
+    n0 is from legacy code, always set it to Ntrain
     """
     if use_tlift and holder_value is None:
         raise ValueError("holder_value must be provided when use_tlift=True")
