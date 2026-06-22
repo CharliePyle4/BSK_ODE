@@ -219,7 +219,7 @@ def evaluate_solution_from_beta(
 
     # Maintain the output order expected by the test code:
     return u, Iu, I2u
-'''
+
 def solvebetas(
     Ksig: torch.Tensor,
     f: torch.Tensor,
@@ -280,82 +280,8 @@ def solvebetas(
     rhs_pred = k1 * u + k2 * Iu + k3 * I2u
 
     return beta, u, rhs_pred, F_star
-'''
 
-def solvebetas(
-    Ksig: torch.Tensor,
-    f: torch.Tensor,
-    x: torch.Tensor,
-    ua: float,
-    upa: float,
-    k1: float,
-    k2: float,
-    k3: float,
-    reg: float = 1e-3,  # treat as fraction of diagonal scale, see below
-):
-    """
-    Ridge-regularized least-squares solver for the ODE kernel system.
 
-    Uses an augmented least-squares formulation:
-        [ Psi         ] beta ≈ [ F_star ]
-        [ sqrt(lam) I ]        [   0    ]
-    which is more numerically robust than directly solving
-        (Psi + lam I) beta = F_star.
-    """
-    dtype = torch.float64
-    device = Ksig.device
-
-    Ksig = Ksig.to(device=device, dtype=dtype)
-    x    = x.to(device=device, dtype=dtype).flatten()
-    f    = f.to(device=device, dtype=dtype).flatten()
-
-    dt = x[1] - x[0]
-
-    K0  = Ksig
-    IK  = trapezoidal_cols(K0, dt)
-    I2K = trapezoidal_cols(IK, dt)
-
-    Psi    = k1 * K0 + k2 * IK + k3 * I2K
-    F_star = trapezoidal_cols(trapezoidal_cols(f, dt), dt)
-
-    if ua != 0.0 or upa != 0.0:
-        print(
-            "Warning: solvebetas assumes zero initial conditions; "
-            "nonzero ua/upa are ignored."
-        )
-
-    # Scale lambda to the mean diagonal size so reg is dimensionless.
-    diag_mean = Psi.diagonal().abs().mean()
-    lam = max(
-        float(reg) * float(diag_mean),
-        float(torch.finfo(dtype).eps) * float(diag_mean),
-    )
-
-    T = Psi.shape[0]
-    root_lam = lam**0.5
-
-    # Build augmented system: A_aug beta ≈ b_aug
-    A_aug = torch.vstack([
-        Psi,
-        root_lam * torch.eye(T, dtype=dtype, device=device),
-    ])
-    b_aug = torch.cat([
-        F_star,
-        torch.zeros(T, dtype=dtype, device=device),
-    ])
-
-    # Least-squares solve
-    beta, *_ = torch.linalg.lstsq(A_aug, b_aug)
-
-    if not torch.isfinite(beta).all():
-        raise ValueError("beta contains NaN/Inf after lstsq. Increase reg.")
-
-    u    = K0  @ beta
-    Iu   = IK  @ beta
-    I2u  = I2K @ beta
-    rhs_pred = k1 * u + k2 * Iu + k3 * I2u
-
-    return beta, u, rhs_pred, F_star
 
 def evaluate_forcing_from_solution(
     u: torch.Tensor,      # really u
@@ -526,6 +452,7 @@ def solve_signature_kernel_calibration(x, f,
                         depth,
                         normalize=True,
                         reg=1e-10,
+                        norm_eps=1e-10,      
                         use_tlift=False,
                         holder_value=None):
 
@@ -545,6 +472,7 @@ def solve_signature_kernel_calibration(x, f,
                 Z=X_sig,
                 depth=depth,
                 dim=X.shape[1],
+                eps=norm_eps,               # ← pass it
                 return_stats=True,
             )
 
@@ -558,7 +486,7 @@ def solve_signature_kernel_calibration(x, f,
             reg=reg
         )
 
-    return u, f_pred_final, alpha, X_sig, med, iqr
+    return u, f_pred_final, alpha, X_sig, med, iqr, norm_eps
 
 def predict_signature_kernel(
     x_train, f_train,
@@ -573,6 +501,7 @@ def predict_signature_kernel(
     X_sig_train=None,
     med=None,
     iqr=None,
+    norm_eps=1e-10,
 ):
     """
     Predict u and f on x_eval using a model calibrated on (x_train, f_train).
@@ -589,7 +518,7 @@ def predict_signature_kernel(
             X_sig_train = compute_signatures(X_train, depth)
             if normalize:
                 X_sig_train = apply_signature_normalization(
-                    X_sig_train, med, iqr
+                    X_sig_train, med, iqr, eps=norm_eps    
                 )
 
         X_eval = torch.stack([x_eval, f_eval], dim=1)
@@ -600,8 +529,9 @@ def predict_signature_kernel(
 
         if normalize:
             X_sig_eval = apply_signature_normalization(
-                X_sig_eval, med, iqr
+                X_sig_eval, med, iqr, eps=norm_eps        
             )
+            
 
         Ksig_eval_train = build_kernel_from_different_signatures(
             X_sig_eval, X_sig_train
@@ -631,6 +561,7 @@ def solve_signature_kernel_predict_retrain(
     depth,
     normalize=True,
     reg=1e-10,
+    norm_eps=1e-10,
     retrain_every: int = 10,
     use_tlift=False,
     holder_value=None,
@@ -657,6 +588,7 @@ def solve_signature_kernel_predict_retrain(
             depth=depth,
             normalize=normalize,
             reg=reg,
+            norm_eps=norm_eps,
             use_tlift=use_tlift,
             holder_value=holder_value,
         )
@@ -690,6 +622,7 @@ def solve_signature_kernel_predict_retrain(
                     depth=depth,
                     normalize=normalize,
                     reg=reg,
+                    norm_eps=norm_eps,
                     use_tlift=use_tlift,
                     holder_value=holder_value,
                 )
@@ -707,6 +640,7 @@ def solve_signature_kernel_predict_retrain(
                 ua=ua, upa=upa,
                 depth=depth,
                 normalize=normalize,
+                norm_eps=norm_eps,
                 use_tlift=use_tlift,
                 holder_value=holder_value,
                 X_sig_train=X_sig_train_fit,
