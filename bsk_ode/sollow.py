@@ -298,7 +298,6 @@ def rolling_online_predict_econ_nonbranched(state, retrain_every=5, max_steps=No
         S_hist = torch.vstack([S_hist, s_new.unsqueeze(0)])
 
         if (i - n0) % retrain_every == 0:
-            print(f"[Retrain] at index {i}")
             retrain_indices.append(i)
 
             K  = S_hist @ S_hist.T
@@ -308,14 +307,11 @@ def rolling_online_predict_econ_nonbranched(state, retrain_every=5, max_steps=No
             Psi_block = Psi[:i + 1, :i + 1]
             F_block   = F_star[:i + 1]  # already on correct device/dtype
 
-            scale = torch.mean(torch.diag(Psi_block))
-            lam   = 1e-13 * scale
-            I_mat = torch.eye(i + 1, dtype=dtype, device=device)
-
-            alphas[:i + 1] = torch.linalg.solve(
-                Psi_block + lam * I_mat,
-                F_block
-            )
+            alphas[:i + 1] = torch.linalg.lstsq(
+                Psi_block,
+                F_block,
+                rcond=torch.finfo(dtype).eps
+            ).solution
 
             F_pred[:i + 1] = Psi_block @ alphas[:i + 1]
             y_pred[:i + 1] = K[:i + 1, :i + 1] @ alphas[:i + 1]
