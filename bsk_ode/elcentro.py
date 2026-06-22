@@ -437,7 +437,7 @@ def apply_signature_normalization(
     Z: torch.Tensor,
     med: torch.Tensor,
     iqr: torch.Tensor,
-    eps: float = 1e-3,
+    eps: float = 1e-10,
 ):
     """
     Apply precomputed normalization stats to signatures.
@@ -688,20 +688,6 @@ def signature_of_path(path, depth: int = 8) -> torch.Tensor:
     return sigs_raw.squeeze(0).to(device=device, dtype=torch.float64).detach()
 
 
-def robust_fit(S: torch.Tensor, eps: float = 1e-5):
-    """Return (median, IQR+eps) column-wise over S (N, D)."""
-    q75 = torch.quantile(S.double(), 0.75, dim=0)
-    q25 = torch.quantile(S.double(), 0.25, dim=0)
-    iqr = q75 - q25
-    N   = S.shape[0]
-    S_sorted = torch.sort(S, dim=0).values
-    med = S_sorted[N // 2] if N % 2 == 1 else (S_sorted[N // 2 - 1] + S_sorted[N // 2]) / 2.0
-    return med, iqr + eps
-
-
-def robust_apply(x: torch.Tensor, med: torch.Tensor, iqr: torch.Tensor) -> torch.Tensor:
-    return (x - med) / iqr
-
 
 # -------------------------------------------------------
 # Rolling online prediction functions
@@ -750,7 +736,8 @@ def build_state(paths,
                 F_star: torch.Tensor,
                 t_vals: torch.Tensor,
                 u_true_interp: torch.Tensor,
-                reg: float = 1e-10) -> dict:
+                reg: float = 1e-10,
+                norm_eps = 1e-10) -> dict:
     """
     Train on the first n0+1 paths and return a state dict
     ready for rolling_online_predict.
@@ -767,8 +754,12 @@ def build_state(paths,
         for i in range(n0 + 1)
     ])  # signature_of_path already returns on `device`
 
-    med, iqr = robust_fit(S0_raw)
-    S0 = robust_apply(S0_raw, med, iqr)
+
+    S0, med, iqr = normalize_signatures(
+    Z=S0_raw, depth=signature_level, dim=S0_raw.shape[1],
+    eps=norm_eps,           
+    return_stats=True,
+    )
 
     K0   = S0 @ S0.T                    # (n0+1, n0+1), on device
     K1_0 = trapezoidal_cols(K0, dt)
@@ -809,7 +800,9 @@ def build_state(paths,
 def rolling_online_predict(state: dict,
                            retrain_every: int = 5,
                            max_steps: int | None = None,
-                           reg: float = 1e-10) -> dict:
+                           reg: float = 1e-10,
+                           norm_eps: float = 1e-10,
+                        ) -> dict:
     """
     Online sequential prediction with periodic full retraining.
     """
@@ -840,11 +833,11 @@ def rolling_online_predict(state: dict,
     u_pred[:n0 + 1] = state["u_pred_train"]
 
     retrain_indices = []
-    eps = 1e-12
 
     for i in range(n0 + 1, end_idx + 1):
         s_raw = signature_of_path(paths[i], depth=depth)
-        s_new = robust_apply(s_raw, med, iqr)
+        s_new = apply_signature_normalization(s_raw, med, iqr, eps=norm_eps)
+
 
         k_row_old = S_hist @ s_new
         k_ii      = float(torch.dot(s_new, s_new).item())
@@ -866,7 +859,7 @@ def rolling_online_predict(state: dict,
         psi_diag    = m * k_ii + c * float(I1[i]) + k * float(I2[i])
 
         residual = F_star[i] - torch.dot(psi_row_old, alphas[:i])
-        alphas[i] = residual / (psi_diag + eps)
+        alphas[i] = residual / (psi_diag + norm_eps)
 
         F_pred[i] = torch.dot(psi_row_old, alphas[:i]) + psi_diag * alphas[i]
         u_pred[i] = torch.dot(k_row_old,   alphas[:i]) + k_ii      * alphas[i]
@@ -887,9 +880,6 @@ def rolling_online_predict(state: dict,
             I_mat  = torch.eye(i + 1, dtype=torch.float64, device=dev)
             alphas[:i + 1] = torch.linalg.solve(Psi_bl + lam * I_mat, F_bl)
 
-            # Do not overwrite historical predictions with the new in-sample fit
-            # F_pred[:i + 1] = Psi_bl @ alphas[:i + 1]
-            # u_pred[:i + 1] = K[:i + 1, :i + 1] @ alphas[:i + 1]
 
     return {
         "F_pred": F_pred,
@@ -909,6 +899,7 @@ def solve_signature_kernel_rolling_retrain(
     depth=8,
     normalize: bool = True,
     reg: float = 1e-10,
+    norm_eps: float = 1e-10,
     retrain_every: int = 10,
     n0: int = 200,
     use_tlift: bool = False,
@@ -922,8 +913,7 @@ def solve_signature_kernel_rolling_retrain(
     This matches the reference implementation where n0=200 is independent of
     the train/test split.
 
-    normalize/reg/ua/upa are accepted for API compatibility; normalization is
-    always applied via robust_fit/robust_apply.
+    n0 is from
     """
     if use_tlift and holder_value is None:
         raise ValueError("holder_value must be provided when use_tlift=True")
@@ -942,7 +932,7 @@ def solve_signature_kernel_rolling_retrain(
 
         # Build prefix paths: paths[i] is the path from index 0..i  (shape (i+1, d))
         if use_tlift:
-            lift_cpu = t_cpu ** (2* holder_value)
+            lift_cpu = t_cpu ** (2 * holder_value)
             paths = [
                 torch.stack([t_cpu[:i+1], f_cpu[:i+1], lift_cpu[:i+1]], dim=1)
                 for i in range(N)
@@ -956,19 +946,26 @@ def solve_signature_kernel_rolling_retrain(
         # Double-integrated forcing — regression target over all N points
         F_star = trapezoidal_cols(trapezoidal_cols(f_all.to(device), dt), dt)
 
+
         state = build_state(
-            paths=paths,
-            n0=n0,
-            signature_level=depth,
-            m=k1, c=k2, k=k3,
-            dt=dt, N=N,
-            F_star=F_star,
-            t_vals=t_all,
-            u_true_interp=torch.zeros(N, dtype=torch.float64),
-            reg=reg,
+        paths=paths,
+        n0=n0,
+        signature_level=depth,
+        m=k1, c=k2, k=k3,
+        dt=dt, N=N,
+        F_star=F_star,
+        t_vals=t_all,
+        u_true_interp=torch.zeros(N, dtype=torch.float64),
+        reg=reg,
+        norm_eps=norm_eps,
         )
 
-        res = rolling_online_predict(state, retrain_every=retrain_every, reg=reg)
+        res = rolling_online_predict(
+            state,
+            retrain_every=retrain_every,
+            reg=reg,
+            norm_eps=norm_eps,
+        )
 
     u_pred = res["u_pred"]
     F_pred = res["F_pred"]
