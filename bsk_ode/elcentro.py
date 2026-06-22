@@ -580,7 +580,8 @@ def solve_signature_kernel_predict_retrain(
          alpha,
          X_sig_train,
          med,
-         iqr) = solve_signature_kernel_calibration(
+         iqr,
+         norm_eps) = solve_signature_kernel_calibration(
             x=t_train,
             f=f_train,
             k1=k1, k2=k2, k3=k3,
@@ -614,7 +615,8 @@ def solve_signature_kernel_predict_retrain(
                  alpha,
                  X_sig_train_fit,
                  med,
-                 iqr) = solve_signature_kernel_calibration(
+                 iqr,
+                 norm_eps) = solve_signature_kernel_calibration(
                     x=t_fit,
                     f=f_fit,
                     k1=k1, k2=k2, k3=k3,
