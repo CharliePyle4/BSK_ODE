@@ -182,12 +182,7 @@ def build_state_nonbranched(paths_nb, n0, signature_level, lambda_econ, dt, t_va
     Psi0 = K0 + lambda_econ * K1_0
 
     rcond = torch.finfo(torch.float64).eps
-    alpha0 = torch.linalg.lstsq(
-        Psi0,
-        F_star_torch[:n0 + 1],
-        rcond=rcond,
-        driver="gelsd",
-    ).solution
+    alpha0 = torch.linalg.pinv(Psi0, rcond=rcond) @ F_star_torch[:n0 + 1]
 
     F_pred_train = Psi0 @ alpha0
     y_pred_train = K0 @ alpha0
