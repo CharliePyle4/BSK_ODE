@@ -657,9 +657,16 @@ def solve_signature_kernel_predict_retrain(
                 [f_pred_full, f_curr_pred[N_train + j - 1 : N_train + j]], dim=0
             )
 
+
     t_all = torch.cat([t_train, t_test], dim=0)
     f_all = torch.cat([f_train, f_test], dim=0)
-    final_loss = forcing_loss(f_all, f_pred_full)
+
+    # build F_star on the same grid, matching rolling
+    dt = t_all[1] - t_all[0]
+    F_star_all = trapezoidal_cols(trapezoidal_cols(f_all, dt), dt)
+
+    # compare F_star (target) to f_pred_full (predicted F_star)
+    final_loss = forcing_loss(F_star_all, f_pred_full)
     print(f"final forcing loss (train+test, last beta): {final_loss.item():.3e}")
 
     return u_pred_full, f_pred_full
