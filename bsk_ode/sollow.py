@@ -305,8 +305,7 @@ def rolling_online_predict_econ_nonbranched(state, retrain_every=5, max_steps=No
                 F_block,
             )
 
-            F_pred[:i + 1] = Psi_block @ alphas[:i + 1]
-            y_pred[:i + 1] = K[:i + 1, :i + 1] @ alphas[:i + 1]
+
 
     return {
         "F_pred":         F_pred,
@@ -465,6 +464,39 @@ def print_error_summary(
             idx_np   = np.asarray(idx, dtype=int)
             mse_val     = mse_fn(pred_arr[idx_np], true_arr[idx_np])
             rel_mse_val = rel_mse_fn(pred_arr[idx_np], true_arr[idx_np])
+
+        print(f"{name:25s} {mse_val:>18.6e} {rel_mse_val:>18.6e} {100 * rel_mse_val:>19.4f}%")
+
+    print(f"{'=' * 86}")
+
+def print_full_error_summary(label, F_pred, F_true, y_pred, y_true, use_torch=True):
+    mse_fn = mse_torch if use_torch else mse_np
+    rel_mse_fn = rel_mse_torch if use_torch else rel_mse_np
+
+    rows = [
+        ("Full forcing",  F_pred, F_true),
+        ("Full solution", y_pred, y_true),
+    ]
+
+    print(f"\n{'=' * 86}")
+    print(f"{label} Error Summary")
+    print(f"{'=' * 86}")
+    print(f"{'Quantity':25s} {'MSE':>18s} {'Relative MSE':>18s} {'Relative MSE (%)':>20s}")
+    print(f"{'-' * 86}")
+
+    for name, pred, true in rows:
+        if use_torch:
+            pred_arr = (pred if isinstance(pred, torch.Tensor)
+                        else torch.tensor(pred, dtype=torch.float64)).to("cpu", dtype=torch.float64)
+            true_arr = (true if isinstance(true, torch.Tensor)
+                        else torch.tensor(true, dtype=torch.float64)).to("cpu", dtype=torch.float64)
+            mse_val     = mse_fn(pred_arr, true_arr)
+            rel_mse_val = rel_mse_fn(pred_arr, true_arr)
+        else:
+            pred_arr = np.asarray(pred)
+            true_arr = np.asarray(true)
+            mse_val     = mse_fn(pred_arr, true_arr)
+            rel_mse_val = rel_mse_fn(pred_arr, true_arr)
 
         print(f"{name:25s} {mse_val:>18.6e} {rel_mse_val:>18.6e} {100 * rel_mse_val:>19.4f}%")
 
