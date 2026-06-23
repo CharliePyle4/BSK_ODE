@@ -549,6 +549,13 @@ def predict_signature_kernel(
             u_eval, u_p_eval, u_dd_eval, k1, k2, k3
         )
 
+        print("Testing.................................")
+        print(f" f train size : {f_train.size()}")
+        print(f" X sig train matrix size : {X_sig_train.size()}")
+        print(f" X sig eval matrix size : {X_sig_eval.size()}")
+        print(f" test ksig matrix size : {X_sig_eval.size()}")
+        print(f" alpha train size : {alpha.size()}")
+
     return u_eval, f_eval_pred
 
 def solve_signature_kernel_predict_retrain(
@@ -593,6 +600,12 @@ def solve_signature_kernel_predict_retrain(
             use_tlift=use_tlift,
             holder_value=holder_value,
         )
+
+        print("Training..................... ")
+        print(f" f train size : {f_train.size()}")
+        print(f" X sig train matrix size : {X_sig_train.size()}")
+        print(f" alpha train: {alpha.size()}")
+        
 
         u_pred_full = u_pred_train.clone()
         f_pred_full = f_pred_train.clone()
