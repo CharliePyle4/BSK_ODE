@@ -561,39 +561,23 @@ def compute_stream_signatures(
     use_tlift: bool = False,
     holder_value: float | None = None,
 ) -> torch.Tensor:
-    """Compute prefix signatures for the full path using keras_sig with stream=True.
+    """Compute prefix signatures for the full path using the same logic as
+    compute_signatures used in calibration (basepoint + stream=True).
 
     Returns:
-        S_all_raw: Tensor of shape (N, D) where row i is the signature of the
-            prefix path from index 0..i (with a basepoint prepended).
+        S_all_raw: Tensor of shape (N, D), one signature per time step.
     """
     if use_tlift:
         if holder_value is None:
             raise ValueError("holder_value must be provided when use_tlift=True")
         lift = t_all ** (2 * holder_value)
-        X_full = torch.stack([t_all, f_all, lift], dim=1)  # (N, d=3)
+        X = torch.stack([t_all, f_all, lift], dim=1)  # (N, d=3)
     else:
-        X_full = torch.stack([t_all, f_all], dim=1)        # (N, d=2)
+        X = torch.stack([t_all, f_all], dim=1)        # (N, d=2)
 
-    # Add batch dimension
-    X_full = X_full.unsqueeze(0)  # (1, N, d)
-
-    # Prepend basepoint as in your original code
-    basepoint = X_full[:, 0:1, :]          # (1, 1, d)
-    X_bp = torch.cat([basepoint, X_full], dim=1)  # (1, N+1, d)
-
-    # Streaming signatures over the whole path
-    sigs_stream = keras_sig.signature(
-        X_bp,
-        depth=depth,
-        stream=True,
-        gpu_optimized=True,
-    )  # shape ~ (1, N+1, D)
-
-    # Drop the basepoint-only prefix; keep N prefixes
-    S_all_raw = sigs_stream[:, 1:, :].squeeze(0)  # (N, D)
-    return S_all_raw.to(device=device, dtype=torch.float64).detach()
-
+    # This already does basepoint+stream=True and returns (N, D)
+    S_all_raw = compute_signatures(X, depth)          # (N, D)
+    return S_all_raw
 
 # -------------------------------------------------------
 # Rolling online prediction functions
