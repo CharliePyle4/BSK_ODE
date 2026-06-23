@@ -661,6 +661,7 @@ def build_state(
         "I2": K2_0[n0, :].clone(),
         "F_pred_train": F_pred_train,
         "u_pred_train": u_pred_train,
+        "lam": lam,
     }
 
 
@@ -683,6 +684,7 @@ def rolling_online_predict(
     F_star = state["F_star"]
     dev = F_star.device
     S_all_raw = state["S_all_raw"]
+    lam = state["lam"]  
 
     end_idx = N - 1 if max_steps is None else min(N - 1, n0 + max_steps)
 
@@ -736,8 +738,9 @@ def rolling_online_predict(
         psi_row_old = m * k_row_old + c * I1[:i] + k * I2[:i]
         psi_diag = m * k_ii + c * float(I1[i]) + k * float(I2[i])
 
+
         residual = F_star[i] - torch.dot(psi_row_old, alphas[:i])
-        alphas[i] = residual / (psi_diag + norm_eps)
+        alphas[i] = residual / (psi_diag + lam + norm_eps)
 
         F_pred[i] = torch.dot(psi_row_old, alphas[:i]) + psi_diag * alphas[i]
         u_pred[i] = torch.dot(k_row_old, alphas[:i]) + k_ii * alphas[i]
