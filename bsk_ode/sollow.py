@@ -103,31 +103,26 @@ def trapezoidal_cols(M, dt):
 
 
 def signature_of_path(path, depth: int = 3) -> torch.Tensor:
-    """
-    Prefix signature of a single path (T, d) using keras_sig.
-    """
-    # Ensure tensor
     if not isinstance(path, torch.Tensor):
         path = torch.tensor(path, dtype=torch.float64)
-
-    # Make shape (1, T, d)
     if path.dim() == 2:
         path = path.unsqueeze(0)
 
-    # Prepend basepoint as in your other code
-    basepoint = path[:, 0:1, :]               # (1, 1, d)
-    path_bp   = torch.cat([basepoint, path], dim=1)  # (1, T+1, d)
+    basepoint = path[:, 0:1, :]
+    path_bp   = torch.cat([basepoint, path], dim=1)
 
-    # Single signature per path → stream=False
     sig_raw = keras_sig.signature(
         path_bp,
         depth         = depth,
-        stream        = False,   # single sig for the whole path
+        stream        = False,
         gpu_optimized = True,
     )
 
-    # (1, D) → (D,)
-    return sig_raw.squeeze(0).to(torch.float64).detach()
+    sig = sig_raw.squeeze(0).to(torch.float64).detach()
+    # Prepend scalar term (=1) to match signatory scalar_term=True behaviour.
+    # This ensures K[0,:] = 1 for all j so the initial condition is pinned.
+    one = torch.ones(1, dtype=torch.float64, device=sig.device)
+    return torch.cat([one, sig])
 
 def interpolate_to_grid(t_source, y_source, t_target):
     idx = torch.searchsorted(t_source.contiguous(), t_target.contiguous())
@@ -187,15 +182,15 @@ def build_state_nonbranched(paths_nb, n0, signature_level, lambda_econ, dt, t_va
     Psi0 = K0 + lambda_econ * K1_0
 
     rcond = torch.finfo(torch.float64).eps
-    y0 = F_star_torch[0]                        # F_star[0] == y0
     alpha0 = torch.linalg.lstsq(
         Psi0,
-        F_star_torch[:n0 + 1] - y0,
+        F_star_torch[:n0 + 1],
         rcond=rcond,
+        driver="gelsd",
     ).solution
 
-    F_pred_train = Psi0 @ alpha0 + y0
-    y_pred_train = K0 @ alpha0 + y0
+    F_pred_train = Psi0 @ alpha0
+    y_pred_train = K0 @ alpha0
 
     return {
         "lambda_econ": lambda_econ,
@@ -256,10 +251,8 @@ def rolling_online_predict_econ_nonbranched(state, retrain_every=5, max_steps=No
 
     retrain_indices = []
     eps = 1e-3
-    y0 = F_star[0]                              # F_star[0] == y(0) since integral is 0 at t=0
 
     for i in range(n0 + 1, end_idx + 1):
-        # signatures
         s_new = signature_of_path(paths[i], depth=depth).to(dtype=dtype, device=device)
 
         k_row_old = S_hist @ s_new
@@ -268,7 +261,6 @@ def rolling_online_predict_econ_nonbranched(state, retrain_every=5, max_steps=No
         I1_new = I1 + 0.5 * (K_prev + k_row_old) * dt
         I1     = I1_new
         K_prev = k_row_old
-
 
         col_i = torch.cat([
             k_row_old,
@@ -291,11 +283,11 @@ def rolling_online_predict_econ_nonbranched(state, retrain_every=5, max_steps=No
         psi_row_old = k_row_old + lambda_econ * I1[:i]
         psi_diag    = k_ii + lambda_econ * I1[i]
 
-        residual   = (F_star[i] - y0) - torch.dot(psi_row_old, alphas[:i])
+        residual   = F_star[i] - torch.dot(psi_row_old, alphas[:i])
         alphas[i]  = residual / (psi_diag + eps)
 
-        F_pred[i] = torch.dot(psi_row_old, alphas[:i]) + psi_diag * alphas[i] + y0
-        y_pred[i] = torch.dot(k_row_old,   alphas[:i]) + k_ii    * alphas[i] + y0
+        F_pred[i] = torch.dot(psi_row_old, alphas[:i]) + psi_diag * alphas[i]
+        y_pred[i] = torch.dot(k_row_old,   alphas[:i]) + k_ii    * alphas[i]
 
         S_hist = torch.vstack([S_hist, s_new.unsqueeze(0)])
 
@@ -309,14 +301,17 @@ def rolling_online_predict_econ_nonbranched(state, retrain_every=5, max_steps=No
             Psi_block = Psi[:i + 1, :i + 1]
             F_block   = F_star[:i + 1]
 
-            alphas[:i + 1] = torch.linalg.lstsq(
-                Psi_block,
-                F_block - y0,
-                rcond=torch.finfo(dtype).eps
-            ).solution
+            scale = torch.mean(torch.diag(Psi_block))
+            lam   = 1e-13 * scale
+            I_mat = torch.eye(i + 1, dtype=dtype, device=device)
 
-            F_pred[:i + 1] = Psi_block @ alphas[:i + 1] + y0
-            y_pred[:i + 1] = K[:i + 1, :i + 1] @ alphas[:i + 1] + y0
+            alphas[:i + 1] = torch.linalg.solve(
+                Psi_block + lam * I_mat,
+                F_block,
+            )
+
+            F_pred[:i + 1] = Psi_block @ alphas[:i + 1]
+            y_pred[:i + 1] = K[:i + 1, :i + 1] @ alphas[:i + 1]
 
     return {
         "F_pred":         F_pred,
@@ -396,15 +391,17 @@ def run_full_batch(
     basepoint   = path_tensor[:, 0:1, :]
     path_bp     = torch.cat([basepoint, path_tensor], dim=1)
 
-    sigs = keras_sig.signature(
+    sigs_raw = keras_sig.signature(
         path_bp,
         depth        = signature_level,
         stream       = True,
         gpu_optimized = True,
-    ).squeeze(0).to(torch.float64).detach().cpu().numpy()
+    ).squeeze(0).to(torch.float64).detach().cpu()
 
-    S   = sigs
-    N_full = len(S)
+    # Prepend scalar term (=1) to match scalar_term=True behaviour
+    N_full = sigs_raw.shape[0]
+    ones   = torch.ones(N_full, 1, dtype=torch.float64)
+    S      = torch.cat([ones, sigs_raw], dim=1).numpy()
 
     K_nb  = np.array([[np.dot(S[i], S[j]) for j in range(N_full)]
                        for i in range(N_full)], dtype=np.float64)
@@ -415,10 +412,9 @@ def run_full_batch(
         K1_nb[:, j] = integrated
 
     Psi_nb = K_nb + lambda_econ * K1_nb
-    y0 = float(F_star[0])                       # F_star[0] == y0 since ∫ from 0 to 0 = 0
-    A_nb   = np.linalg.lstsq(Psi_nb, F_star - y0, rcond=None)[0]
-    F_hat  = Psi_nb @ A_nb + y0
-    K_A    = K_nb   @ A_nb + y0
+    A_nb   = np.linalg.lstsq(Psi_nb, F_star, rcond=None)[0]
+    F_hat  = Psi_nb @ A_nb
+    K_A    = K_nb   @ A_nb
 
     return {"F_hat": F_hat, "K_A": K_A, "A": A_nb, "K": K_nb, "K1": K1_nb}
 
