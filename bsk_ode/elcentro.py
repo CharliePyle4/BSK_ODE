@@ -279,7 +279,7 @@ def solve_signature_kernel_calibration(x, f,
 # -------------------------------------------------------
 # Signature + normalization helpers (rolling version)
 # -------------------------------------------------------
-
+'''
 def signature_of_path(path, depth: int = 8) -> torch.Tensor:
     """Prefix signature of a single path (T, d) using keras_sig."""
     if not isinstance(path, torch.Tensor):
@@ -295,7 +295,6 @@ def signature_of_path(path, depth: int = 8) -> torch.Tensor:
         gpu_optimized=True,
     )
     return sigs_raw.squeeze(0).to(device=device, dtype=torch.float64).detach()
-
 
 
 # -------------------------------------------------------
@@ -549,8 +548,320 @@ def solve_signature_kernel_rolling_retrain(
 
     return u_pred, F_pred
 
+'''
+
+# -------------------------------------------------------
+# Signature + normalization helpers (rolling version)
+# -------------------------------------------------------
+
+def compute_stream_signatures(
+    t_all: torch.Tensor,
+    f_all: torch.Tensor,
+    depth: int,
+    use_tlift: bool = False,
+    holder_value: float | None = None,
+) -> torch.Tensor:
+    """Compute prefix signatures for the full path using keras_sig with stream=True.
+
+    Returns:
+        S_all_raw: Tensor of shape (N, D) where row i is the signature of the
+            prefix path from index 0..i (with a basepoint prepended).
+    """
+    if use_tlift:
+        if holder_value is None:
+            raise ValueError("holder_value must be provided when use_tlift=True")
+        lift = t_all ** (2 * holder_value)
+        X_full = torch.stack([t_all, f_all, lift], dim=1)  # (N, d=3)
+    else:
+        X_full = torch.stack([t_all, f_all], dim=1)        # (N, d=2)
+
+    # Add batch dimension
+    X_full = X_full.unsqueeze(0)  # (1, N, d)
+
+    # Prepend basepoint as in your original code
+    basepoint = X_full[:, 0:1, :]          # (1, 1, d)
+    X_bp = torch.cat([basepoint, X_full], dim=1)  # (1, N+1, d)
+
+    # Streaming signatures over the whole path
+    sigs_stream = keras_sig.signature(
+        X_bp,
+        depth=depth,
+        stream=True,
+        gpu_optimized=True,
+    )  # shape ~ (1, N+1, D)
+
+    # Drop the basepoint-only prefix; keep N prefixes
+    S_all_raw = sigs_stream[:, 1:, :].squeeze(0)  # (N, D)
+    return S_all_raw.to(device=device, dtype=torch.float64).detach()
 
 
+# -------------------------------------------------------
+# Rolling online prediction functions
+# -------------------------------------------------------
+
+def build_state(
+    S_all_raw: torch.Tensor,
+    n0: int,
+    signature_level: int,
+    m: float,
+    c: float,
+    k: float,
+    dt: float,
+    N: int,
+    F_star: torch.Tensor,
+    t_vals: torch.Tensor,
+    u_true_interp: torch.Tensor,
+    reg: float = 1e-10,
+    norm_eps: float = 1e-10,
+) -> dict:
+    """
+    Train on the first n0+1 points and return a state dict
+    ready for rolling_online_predict.
+    """
+
+    # --- move inputs to device once ---
+    F_star = F_star.to(device)
+    t_vals = t_vals.to(device)
+    u_true_interp = u_true_interp.to(device)
+
+    # signatures for first n0+1 points (prefix signatures already)
+    S0_raw = S_all_raw[: n0 + 1]  # (n0+1, D)
+
+    S0, med, iqr = normalize_signatures(
+        Z=S0_raw,
+        depth=signature_level,
+        dim=S0_raw.shape[1],
+        eps=norm_eps,
+        return_stats=True,
+    )
+
+    K0 = S0 @ S0.T                   # (n0+1, n0+1), on device
+    K1_0 = trapezoidal_cols(K0, dt)
+    K2_0 = trapezoidal_cols(K1_0, dt)
+
+    Psi0 = m * K0 + c * K1_0 + k * K2_0
+
+    # Ridge-regularized solve (replaces gelsd which is CPU-only)
+    T = Psi0.shape[0]
+    lam = max(
+        float(reg),
+        float(torch.finfo(torch.float64).eps)
+        * float(Psi0.diagonal().abs().mean()),
+    )
+    alpha0 = torch.linalg.solve(
+        Psi0 + lam * torch.eye(T, dtype=torch.float64, device=device),
+        F_star[: n0 + 1],
+    )
+
+    F_pred_train = Psi0 @ alpha0
+    u_pred_train = K0 @ alpha0
+
+    return {
+        "m": m,
+        "c": c,
+        "k": k,
+        "dt": dt,
+        "n0": n0,
+        "N": N,
+        "signature_level": signature_level,
+        "med": med,
+        "iqr": iqr,
+        "F_star": F_star,
+        "t_vals": t_vals,
+        "u_true_interp": u_true_interp,
+        "alpha0": alpha0,
+        "S_hist": S0.clone(),         # history of normalized sigs
+        "S_all_raw": S_all_raw,       # all (unnormalized) prefix sigs
+        "K_prev": K0[n0, :].clone(),
+        "I1": K1_0[n0, :].clone(),
+        "I2": K2_0[n0, :].clone(),
+        "F_pred_train": F_pred_train,
+        "u_pred_train": u_pred_train,
+    }
+
+
+def rolling_online_predict(
+    state: dict,
+    retrain_every: int = 5,
+    max_steps: int | None = None,
+    reg: float = 1e-10,
+    norm_eps: float = 1e-10,
+) -> dict:
+    """
+    Online sequential prediction with periodic full retraining.
+    """
+    m, c, k = state["m"], state["c"], state["k"]
+    dt = state["dt"]
+    n0 = state["n0"]
+    N = state["N"]
+    depth = state["signature_level"]
+    med, iqr = state["med"], state["iqr"]
+    F_star = state["F_star"]
+    dev = F_star.device
+    S_all_raw = state["S_all_raw"]
+
+    end_idx = N - 1 if max_steps is None else min(N - 1, n0 + max_steps)
+
+    S_hist = state["S_hist"].clone()
+    alphas = torch.zeros(end_idx + 1, dtype=torch.float64, device=dev)
+    alphas[: n0 + 1] = state["alpha0"]
+
+    K_prev = state["K_prev"].clone()
+    I1 = state["I1"].clone()
+    I2 = state["I2"].clone()
+
+    F_pred = torch.zeros(end_idx + 1, dtype=torch.float64, device=dev)
+    u_pred = torch.zeros(end_idx + 1, dtype=torch.float64, device=dev)
+
+    F_pred[: n0 + 1] = state["F_pred_train"]
+    u_pred[: n0 + 1] = state["u_pred_train"]
+
+    retrain_indices = []
+
+    for i in range(n0 + 1, end_idx + 1):
+        # Take precomputed (unnormalized) prefix signature at index i
+        s_raw = S_all_raw[i]  # (D,)
+        s_new = apply_signature_normalization(
+            s_raw.unsqueeze(0), med, iqr, eps=norm_eps
+        ).squeeze(0)  # (D,)
+
+        k_row_old = S_hist @ s_new
+        k_ii = float(torch.dot(s_new, s_new).item())
+
+        I1_new = I1 + 0.5 * (K_prev + k_row_old) * dt
+        I2_new = I2 + 0.5 * (I1 + I1_new) * dt
+        I1, I2 = I1_new, I2_new
+        K_prev = k_row_old
+
+        col_i = torch.cat(
+            [k_row_old, torch.tensor([k_ii], dtype=torch.float64, device=dev)]
+        )
+        inner_i = trapezoidal_cols(col_i, dt)
+        outer_i = trapezoidal_cols(inner_i, dt)
+
+        I1 = torch.cat(
+            [I1, torch.tensor([float(inner_i[-1])], dtype=torch.float64, device=dev)]
+        )
+        I2 = torch.cat(
+            [I2, torch.tensor([float(outer_i[-1])], dtype=torch.float64, device=dev)]
+        )
+        K_prev = torch.cat(
+            [K_prev, torch.tensor([k_ii], dtype=torch.float64, device=dev)]
+        )
+
+        psi_row_old = m * k_row_old + c * I1[:i] + k * I2[:i]
+        psi_diag = m * k_ii + c * float(I1[i]) + k * float(I2[i])
+
+        residual = F_star[i] - torch.dot(psi_row_old, alphas[:i])
+        alphas[i] = residual / (psi_diag + norm_eps)
+
+        F_pred[i] = torch.dot(psi_row_old, alphas[:i]) + psi_diag * alphas[i]
+        u_pred[i] = torch.dot(k_row_old, alphas[:i]) + k_ii * alphas[i]
+
+        S_hist = torch.vstack([S_hist, s_new.unsqueeze(0)])
+
+        if (i - n0) % retrain_every == 0:
+            retrain_indices.append(i)
+
+            K = S_hist @ S_hist.T
+            K1 = trapezoidal_cols(K, dt)
+            K2 = trapezoidal_cols(K1, dt)
+            Psi = m * K + c * K1 + k * K2
+            Psi_bl = Psi[: i + 1, : i + 1]
+            F_bl = F_star[: i + 1]
+
+            lam = max(
+                float(reg),
+                float(torch.finfo(torch.float64).eps)
+                * float(Psi_bl.diagonal().abs().mean()),
+            )
+            I_mat = torch.eye(i + 1, dtype=torch.float64, device=dev)
+            alphas[: i + 1] = torch.linalg.solve(Psi_bl + lam * I_mat, F_bl)
+
+    return {
+        "F_pred": F_pred,
+        "u_pred": u_pred,
+        "retrain_indices": retrain_indices,
+        "end_idx": end_idx,
+    }
+
+
+def solve_signature_kernel_rolling_retrain(
+    t_train: torch.Tensor,
+    t_test: torch.Tensor,
+    f_train: torch.Tensor,
+    f_test: torch.Tensor,
+    k1,
+    k2,
+    k3,
+    ua=0.0,
+    upa=0.0,
+    depth=8,
+    normalize: bool = True,
+    reg: float = 1e-10,
+    norm_eps: float = 1e-10,
+    retrain_every: int = 10,
+    n0: int = 200,
+    use_tlift: bool = False,
+    holder_value=None,
+):
+    """
+    Rolling retrain using streamed prefix signatures + incremental Gauss-Seidel update.
+    """
+    if use_tlift and holder_value is None:
+        raise ValueError("holder_value must be provided when use_tlift=True")
+
+    with torch.no_grad():
+        t_all = torch.cat([t_train, t_test], dim=0).to(dtype=torch.float64)
+        f_all = torch.cat([f_train, f_test], dim=0).to(dtype=torch.float64)
+        N = t_all.numel()
+        dt = float((t_all[1] - t_all[0]).item())
+
+        if n0 >= N:
+            raise ValueError(f"n0={n0} must be less than total points N={N}")
+
+        # Precompute all prefix signatures in one streaming call
+        S_all_raw = compute_stream_signatures(
+            t_all,
+            f_all,
+            depth=depth,
+            use_tlift=use_tlift,
+            holder_value=holder_value,
+        )
+
+        # Double-integrated forcing — regression target over all N points
+        F_star = trapezoidal_cols(trapezoidal_cols(f_all.to(device), dt), dt)
+
+        state = build_state(
+            S_all_raw=S_all_raw,
+            n0=n0,
+            signature_level=depth,
+            m=k1,
+            c=k2,
+            k=k3,
+            dt=dt,
+            N=N,
+            F_star=F_star,
+            t_vals=t_all,
+            u_true_interp=torch.zeros(N, dtype=torch.float64),
+            reg=reg,
+            norm_eps=norm_eps,
+        )
+
+        res = rolling_online_predict(
+            state,
+            retrain_every=retrain_every,
+            reg=reg,
+            norm_eps=norm_eps,
+        )
+
+    u_pred = res["u_pred"]
+    F_pred = res["F_pred"]
+
+    final_loss = forcing_loss(F_star, F_pred)
+    print(f"final forcing loss (train+test, rolling): {final_loss.item():.3e}")
+
+    return u_pred, F_pred
 
 
 
