@@ -551,10 +551,14 @@ def predict_signature_kernel(
 
         print("Testing.................................")
         print(f" f train size : {f_train.size()}")
+        print(f" f eval size : {f_eval.size()}")
+        print(f" alpha train size : {alpha.size()}")
         print(f" X sig train matrix size : {X_sig_train.size()}")
         print(f" X sig eval matrix size : {X_sig_eval.size()}")
-        print(f" test ksig matrix size : {X_sig_eval.size()}")
-        print(f" alpha train size : {alpha.size()}")
+        print(f" test ksig matrix size : {Ksig_eval_train.size()}")
+        print(f" ku matrix size : {Ku_eval.size()}")
+        print(f" u eval size : {u_eval.size()}")
+
 
     return u_eval, f_eval_pred
 
