@@ -187,14 +187,15 @@ def build_state_nonbranched(paths_nb, n0, signature_level, lambda_econ, dt, t_va
     Psi0 = K0 + lambda_econ * K1_0
 
     rcond = torch.finfo(torch.float64).eps
+    y0 = F_star_torch[0]                        # F_star[0] == y0
     alpha0 = torch.linalg.lstsq(
         Psi0,
-        F_star_torch[:n0 + 1],
+        F_star_torch[:n0 + 1] - y0,
         rcond=rcond,
     ).solution
 
-    F_pred_train = Psi0 @ alpha0
-    y_pred_train = K0 @ alpha0
+    F_pred_train = Psi0 @ alpha0 + y0
+    y_pred_train = K0 @ alpha0 + y0
 
     return {
         "lambda_econ": lambda_econ,
@@ -255,6 +256,7 @@ def rolling_online_predict_econ_nonbranched(state, retrain_every=5, max_steps=No
 
     retrain_indices = []
     eps = 1e-3
+    y0 = F_star[0]                              # F_star[0] == y(0) since integral is 0 at t=0
 
     for i in range(n0 + 1, end_idx + 1):
         # signatures
@@ -267,7 +269,7 @@ def rolling_online_predict_econ_nonbranched(state, retrain_every=5, max_steps=No
         I1     = I1_new
         K_prev = k_row_old
 
-        
+
         col_i = torch.cat([
             k_row_old,
             torch.tensor([k_ii.item()], dtype=dtype, device=device)
@@ -289,11 +291,11 @@ def rolling_online_predict_econ_nonbranched(state, retrain_every=5, max_steps=No
         psi_row_old = k_row_old + lambda_econ * I1[:i]
         psi_diag    = k_ii + lambda_econ * I1[i]
 
-        residual   = F_star[i] - torch.dot(psi_row_old, alphas[:i])
+        residual   = (F_star[i] - y0) - torch.dot(psi_row_old, alphas[:i])
         alphas[i]  = residual / (psi_diag + eps)
 
-        F_pred[i] = torch.dot(psi_row_old, alphas[:i]) + psi_diag * alphas[i]
-        y_pred[i] = torch.dot(k_row_old,   alphas[:i]) + k_ii    * alphas[i]
+        F_pred[i] = torch.dot(psi_row_old, alphas[:i]) + psi_diag * alphas[i] + y0
+        y_pred[i] = torch.dot(k_row_old,   alphas[:i]) + k_ii    * alphas[i] + y0
 
         S_hist = torch.vstack([S_hist, s_new.unsqueeze(0)])
 
@@ -305,16 +307,16 @@ def rolling_online_predict_econ_nonbranched(state, retrain_every=5, max_steps=No
             Psi = K + lambda_econ * K1
 
             Psi_block = Psi[:i + 1, :i + 1]
-            F_block   = F_star[:i + 1]  # already on correct device/dtype
+            F_block   = F_star[:i + 1]
 
             alphas[:i + 1] = torch.linalg.lstsq(
                 Psi_block,
-                F_block,
+                F_block - y0,
                 rcond=torch.finfo(dtype).eps
             ).solution
 
-            F_pred[:i + 1] = Psi_block @ alphas[:i + 1]
-            y_pred[:i + 1] = K[:i + 1, :i + 1] @ alphas[:i + 1]
+            F_pred[:i + 1] = Psi_block @ alphas[:i + 1] + y0
+            y_pred[:i + 1] = K[:i + 1, :i + 1] @ alphas[:i + 1] + y0
 
     return {
         "F_pred":         F_pred,
@@ -412,10 +414,11 @@ def run_full_batch(
         integrated = trapezoidal_array(K_nb[:, j], dt)
         K1_nb[:, j] = integrated
 
-    Psi_nb = K_nb + lambda_econ * K1_nb    # note: pass lambda_econ as param (see below)
-    A_nb   = np.linalg.lstsq(Psi_nb, F_star, rcond=None)[0]
-    F_hat  = Psi_nb @ A_nb
-    K_A    = K_nb   @ A_nb
+    Psi_nb = K_nb + lambda_econ * K1_nb
+    y0 = float(F_star[0])                       # F_star[0] == y0 since ∫ from 0 to 0 = 0
+    A_nb   = np.linalg.lstsq(Psi_nb, F_star - y0, rcond=None)[0]
+    F_hat  = Psi_nb @ A_nb + y0
+    K_A    = K_nb   @ A_nb + y0
 
     return {"F_hat": F_hat, "K_A": K_A, "A": A_nb, "K": K_nb, "K1": K1_nb}
 
