@@ -1421,13 +1421,15 @@ def test_nonbranched_method2(
             u_pred_full = torch.cat([u_pred_full, u_curr[N_train + j - 1:N_train + j]], dim=0)
             f_pred_full = torch.cat([f_pred_full, f_curr_pred[N_train + j - 1:N_train + j]], dim=0)
 
-    #Testing done, print accuracy of forcing
+
     x_all = torch.cat([x_train, x_test], dim=0)
     f_all = torch.cat([f_train, f_test], dim=0)
-    final_loss = forcing_loss(f_all, f_pred_full)
-    print(f"final forcing loss (train+test, last beta): {final_loss.item():.3e}")
+    rhs_all = rhs_method2(f=f_all, x=x_all, ua=ua, upa=upa, k1=k1, k2=k2)
+    final_loss = forcing_loss(rhs_all, f_pred_full)
+    print(f"final integrated-target loss (train+test, last beta): {final_loss.item():.3e}")
 
     return u_pred_full, f_pred_full
+
 
 def test_branched_tlift_method2(
     x_train: torch.Tensor,
@@ -1504,8 +1506,10 @@ def test_branched_tlift_method2(
     #Testing done, print accuracy of forcing
     x_all = torch.cat([x_train, x_test], dim=0)
     f_all = torch.cat([f_train, f_test], dim=0)
-    final_loss = forcing_loss(f_all, f_pred_full)
-    print(f"final forcing loss (train+test, last beta): {final_loss.item():.3e}")
+    rhs_all = rhs_method2(f=f_all, x=x_all, ua=ua, upa=upa, k1=k1, k2=k2)
+    final_loss = forcing_loss(rhs_all, f_pred_full)
+    print(f"final integrated-target loss (train+test, last beta): {final_loss.item():.3e}")
+
 
     return u_pred_full, f_pred_full
 
@@ -1588,8 +1592,10 @@ def test_branched_NN_method2(
     #Testing done, print accuracy of forcing
     x_all = torch.cat([x_train, x_test], dim=0)
     f_all = torch.cat([f_train, f_test], dim=0)
-    final_loss = forcing_loss(f_all, f_pred_full)
-    print(f"final forcing loss (train+test, last beta): {final_loss.item():.3e}")
+    rhs_all = rhs_method2(f=f_all, x=x_all, ua=ua, upa=upa, k1=k1, k2=k2)
+    final_loss = forcing_loss(rhs_all, f_pred_full)
+    print(f"final integrated-target loss (train+test, last beta): {final_loss.item():.3e}")
+
 
     return u_pred_full, f_pred_full
 
@@ -1771,27 +1777,6 @@ def plot_learned_extensions(x, f_true, X_ext, title_prefix="Learned extensions")
     fig.tight_layout()
     plt.show()
 
-
-def print_pct_improvement(label, errs, baseline):
-    """Print % improvement of errs vs baseline (positive = better, negative = worse)."""
-    def pct(b, v): return 100.0 * (b - v) / (abs(b) + 1e-12)
-    print(f"  [{label}]"
-          f"  MSE(u)={pct(baseline['mse_u'], errs['mse_u']):+.1f}%"
-          f"  Rel(u)={pct(baseline['rel_u'], errs['rel_u']):+.1f}%"
-          f"  MSE(f)={pct(baseline['mse_f'], errs['mse_f']):+.1f}%"
-          f"  Rel(f)={pct(baseline['rel_f'], errs['rel_f']):+.1f}%")
-
-# ── Helper: print error table for a single variant ──
-def print_variant_errors(label, u_pred, f_pred, u_ref, f_true, x):
-    from torch import mean, sqrt
-    eps = 1e-12
-    u_p, f_p = u_pred.detach().cpu(), f_pred.detach().cpu()
-    u_r, f_t = u_ref.detach().cpu(),  f_true.detach().cpu()
-    mse_u = mean((u_p - u_r)**2).item()
-    rel_u = (sqrt(mean((u_p - u_r)**2)) / (sqrt(mean(u_r**2)) + eps)).item()
-    mse_f = mean((f_p - f_t)**2).item()
-    rel_f = (sqrt(mean((f_p - f_t)**2)) / (sqrt(mean(f_t**2)) + eps)).item()
-    print(f"  [{label}]  MSE(u)={mse_u:.3e}  Rel(u)={rel_u:.3e}  MSE(f)={mse_f:.3e}  Rel(f)={rel_f:.3e}")
 
 
 def plot_all_extensions(
@@ -2113,6 +2098,7 @@ def compare_branched_nonbranched_method1_vs_method2(
     }
 
 
+
 def get_errors(u_pred, f_pred, u_ref, f_true):
     from torch import mean
     eps = 1e-12
@@ -2122,11 +2108,10 @@ def get_errors(u_pred, f_pred, u_ref, f_true):
     mse_f = mean((f_p - f_t)**2).item()
     return {
         "mse_u": mse_u,
-        "rel_u": mse_u / (mean(u_r**2).item() + eps),    # Rel MSE
+        "rel_u": mse_u / (mean(u_r**2).item() + eps),
         "mse_f": mse_f,
-        "rel_f": mse_f / (mean(f_t**2).item() + eps),    # Rel MSE
+        "rel_f": mse_f / (mean(f_t**2).item() + eps),
     }
-
 
 def print_pct_improvement(label, errs, baseline):
     def pct(b, v): return 100.0 * (b - v) / (abs(b) + 1e-12)
@@ -2137,17 +2122,20 @@ def print_pct_improvement(label, errs, baseline):
           f"  RelMSE(f)={pct(baseline['rel_f'], errs['rel_f']):+.1f}%")
 
 
-def print_variant_errors(label, u_pred, f_pred, u_ref, f_true, x):
+def print_variant_errors(label, u_pred, target_pred, u_ref, target_true, x, target_label="f"):
     from torch import mean
     eps = 1e-12
-    u_p, f_p = u_pred.detach().cpu(), f_pred.detach().cpu()
-    u_r, f_t = u_ref.detach().cpu(),  f_true.detach().cpu()
+    u_p, t_p = u_pred.detach().cpu(), target_pred.detach().cpu()
+    u_r, t_t = u_ref.detach().cpu(), target_true.detach().cpu()
     mse_u = mean((u_p - u_r)**2).item()
-    mse_f = mean((f_p - f_t)**2).item()
+    mse_t = mean((t_p - t_t)**2).item()
     rel_u = mse_u / (mean(u_r**2).item() + eps)
-    rel_f = mse_f / (mean(f_t**2).item() + eps)
-    print(f"  [{label}]  MSE(u)={mse_u:.3e}  RelMSE(u)={rel_u:.3e}  MSE(f)={mse_f:.3e}  RelMSE(f)={rel_f:.3e}")
-
+    rel_t = mse_t / (mean(t_t**2).item() + eps)
+    print(
+        f"  [{label}]  "
+        f"MSE(u)={mse_u:.3e}  RelMSE(u)={rel_u:.3e}  "
+        f"MSE({target_label})={mse_t:.3e}  RelMSE({target_label})={rel_t:.3e}"
+    )
 
 
 # ── Helper ────────────────────────────────────────────────────────────────────
@@ -2529,7 +2517,7 @@ def print_all_errors(
     """
     Print the full error table (variant errors, % improvement vs
     non-branched baseline, Method 1 vs Method 2 solution improvement)
-    for a given split.  split_label is e.g. 'FULL (train+test)' or
+    for a given split. split_label is e.g. 'FULL (train+test)' or
     'TEST ONLY'.
 
     Returns a dict with keys nb_m1, tl_m1, sig_m1, nb_m2, tl_m2,
@@ -2539,14 +2527,14 @@ def print_all_errors(
           "non-branched, t-lift, branched | method 1 vs method 2")
 
     print(f"\n--- Method 1 ({split_label}) ---")
-    print_variant_errors("Non-branched", u_nb_m1,  f_pred_nb_m1,  u_ref, forcing, x)
-    print_variant_errors("t-lift      ", u_tl_m1,  f_pred_tl_m1,  u_ref, forcing, x)
-    print_variant_errors("Branched    ", u_sig_m1, f_pred_sig_m1, u_ref, forcing, x)
+    print_variant_errors("Non-branched", u_nb_m1,  f_pred_nb_m1,  u_ref, forcing, x, target_label="f")
+    print_variant_errors("t-lift      ", u_tl_m1,  f_pred_tl_m1,  u_ref, forcing, x, target_label="f")
+    print_variant_errors("Branched    ", u_sig_m1, f_pred_sig_m1, u_ref, forcing, x, target_label="f")
 
     print(f"\n--- Method 2 ({split_label}) ---")
-    print_variant_errors("Non-branched", u_nb_m2,  f_pred_nb_m2,  u_ref, rhs_m2, x)
-    print_variant_errors("t-lift      ", u_tl_m2,  f_pred_tl_m2,  u_ref, rhs_m2, x)
-    print_variant_errors("Branched    ", u_sig_m2, f_pred_sig_m2, u_ref, rhs_m2, x)
+    print_variant_errors("Non-branched", u_nb_m2,  f_pred_nb_m2,  u_ref, rhs_m2, x, target_label="rhs")
+    print_variant_errors("t-lift      ", u_tl_m2,  f_pred_tl_m2,  u_ref, rhs_m2, x, target_label="rhs")
+    print_variant_errors("Branched    ", u_sig_m2, f_pred_sig_m2, u_ref, rhs_m2, x, target_label="rhs")
 
     nb_m1  = get_errors(u_nb_m1,  f_pred_nb_m1,  u_ref, forcing)
     tl_m1  = get_errors(u_tl_m1,  f_pred_tl_m1,  u_ref, forcing)
@@ -2578,5 +2566,7 @@ def print_all_errors(
               f"  MSE(u)={pct(e_m1['mse_u'], e_m2['mse_u']):+.1f}%"
               f"  Rel(u)={pct(e_m1['rel_u'], e_m2['rel_u']):+.1f}%")
 
-    return dict(nb_m1=nb_m1, tl_m1=tl_m1, sig_m1=sig_m1,
-                nb_m2=nb_m2, tl_m2=tl_m2, sig_m2=sig_m2)
+    return dict(
+        nb_m1=nb_m1, tl_m1=tl_m1, sig_m1=sig_m1,
+        nb_m2=nb_m2, tl_m2=tl_m2, sig_m2=sig_m2
+    )
